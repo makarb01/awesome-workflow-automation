@@ -474,7 +474,7 @@ async function synthesizeAnswerWithGemini(question, contextBlocks, chatMemoryCon
     "If the user asks what changed, compare recent calls and list concrete changes.\n" +
     "Always anchor statements with meeting title/date when possible.\n" +
     "If data is insufficient, explicitly say what is missing.\n" +
-    "Keep response concise and useful (4-8 bullets + short conclusion).\n\n" +
+    "Output format: 3-5 short bullets (each <= 22 words), then one short conclusion sentence.\n\n" +
     `User question:\n${question}\n\n` +
     (chatMemoryContext ? `Recent chat memory:\n${chatMemoryContext}\n\n` : "") +
     `Context:\n${context}`;
@@ -488,7 +488,10 @@ async function synthesizeAnswerWithGemini(question, contextBlocks, chatMemoryCon
     generationConfig: {
       temperature: 0.2,
       topP: 0.9,
-      maxOutputTokens: 900,
+      maxOutputTokens: 700,
+      thinkingConfig: {
+        thinkingBudget: 0,
+      },
     },
   };
 
@@ -508,13 +511,55 @@ async function synthesizeAnswerWithGemini(question, contextBlocks, chatMemoryCon
   }
 
   const data = await res.json();
+  const firstCandidate = (data?.candidates || [])[0] || {};
   const answer = (data?.candidates || [])
     .flatMap((c) => c?.content?.parts || [])
     .map((p) => p?.text || "")
     .join("\n")
     .trim();
 
-  return answer || "";
+  const finishReason = String(firstCandidate?.finishReason || "").toUpperCase();
+  const looksIncomplete = /[,:;\-\(\[]$/.test(answer) || !/[.!?]$/.test(answer);
+  const needsRepair = finishReason === "MAX_TOKENS" || finishReason === "RECITATION" || looksIncomplete;
+  if (!answer || !needsRepair) return answer || "";
+
+  const repairPrompt =
+    "Rewrite the draft into a complete answer in English.\n" +
+    "Rules: 3-5 short bullets + 1 short conclusion sentence.\n" +
+    "Do not quote notes verbatim. Do not add new facts.\n\n" +
+    `User question:\n${question}\n\n` +
+    `Draft answer:\n${answer}`;
+
+  const repairPayload = {
+    contents: [{ role: "user", parts: [{ text: repairPrompt }] }],
+    generationConfig: {
+      temperature: 0.1,
+      maxOutputTokens: 320,
+      thinkingConfig: {
+        thinkingBudget: 0,
+      },
+    },
+  };
+
+  const repairRes = await withTimeout(
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(repairPayload),
+    }),
+    18000,
+    "Gemini repair request",
+  );
+  if (!repairRes.ok) return answer;
+
+  const repairData = await repairRes.json();
+  const repaired = (repairData?.candidates || [])
+    .flatMap((c) => c?.content?.parts || [])
+    .map((p) => p?.text || "")
+    .join("\n")
+    .trim();
+
+  return repaired || answer;
 }
 
 async function answerQuestion(question, chatId = "") {
