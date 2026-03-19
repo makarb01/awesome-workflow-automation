@@ -46,6 +46,25 @@ const ASANA_ACCESS_TOKEN = process.env.ASANA_ACCESS_TOKEN || process.env.ASANA_T
 const ASANA_WORKSPACE_GID = process.env.ASANA_WORKSPACE_GID || "";
 const ASANA_PROJECT_NAME = process.env.ASANA_PROJECT_NAME || "General Tasks";
 const ASANA_TASK_LIST_LIMIT = parseInt(process.env.ASANA_TASK_LIST_LIMIT || "20", 10);
+const ASANA_OVERDUE_ENABLED = (process.env.ASANA_OVERDUE_ENABLED || "1") === "1";
+const ASANA_OVERDUE_INTERVAL_MINUTES = parseInt(process.env.ASANA_OVERDUE_INTERVAL_MINUTES || "30", 10);
+const ASANA_OVERDUE_THRESHOLDS = (process.env.ASANA_OVERDUE_THRESHOLDS || "0,2,7")
+  .split(",")
+  .map((x) => parseInt(x.trim(), 10))
+  .filter((n) => Number.isInteger(n) && n >= 0)
+  .sort((a, b) => a - b);
+const ASANA_OVERDUE_SECTION_NAMES = (process.env.ASANA_OVERDUE_SECTION_NAMES || "To Do,Doing")
+  .split(",")
+  .map((x) => x.trim().toLowerCase())
+  .filter(Boolean);
+const ASANA_OVERDUE_ALERT_CHAT_IDS = (process.env.ASANA_OVERDUE_ALERT_CHAT_IDS || "")
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
+const ASANA_OVERDUE_STATE_FILE = process.env.ASANA_OVERDUE_STATE_FILE || path.join(MEMORY_BANK_DIR, "asana-overdue-state.json");
+const ASANA_OVERDUE_MAX_TASKS = parseInt(process.env.ASANA_OVERDUE_MAX_TASKS || "80", 10);
+const ASANA_OVERDUE_STARTUP_DELAY_MS = parseInt(process.env.ASANA_OVERDUE_STARTUP_SECONDS || "30", 10) * 1000;
+const ASANA_OVERDUE_ERROR_COOLDOWN_MS = parseInt(process.env.ASANA_OVERDUE_ERROR_COOLDOWN_MS || "21600000", 10);
 
 const MCP_TOOL_CACHE = {
   names: null,
@@ -56,6 +75,12 @@ const MCP_TOOL_CACHE_TTL_MS = 5 * 60 * 1000;
 let CHAT_HISTORY_LOADED = false;
 const CHAT_HISTORY_BY_CHAT = new Map();
 let ASANA_PROJECT_GID_CACHE = (process.env.ASANA_PROJECT_GID || "").trim();
+let ASANA_OVERDUE_STATE_LOADED = false;
+let ASANA_OVERDUE_LAST_ERROR_TS = 0;
+const ASANA_OVERDUE_STATE = {
+  task_levels: {},
+  task_notified_at: {},
+};
 
 const ACCOUNT_PROFILE_HINT_TERMS = [
   "meta",
@@ -266,9 +291,6 @@ function asanaConfigHint() {
   if (!ASANA_ACCESS_TOKEN) {
     return "Missing ASANA_ACCESS_TOKEN in .env.";
   }
-  if (!ASANA_PROJECT_GID_CACHE && !ASANA_WORKSPACE_GID) {
-    return "Missing ASANA_PROJECT_GID (or ASANA_WORKSPACE_GID to resolve by project name).";
-  }
   return "";
 }
 
@@ -322,25 +344,42 @@ async function asanaRequest(method, pathname, { query = {}, body = null } = {}) 
 
 async function resolveAsanaProjectGid() {
   if (ASANA_PROJECT_GID_CACHE) return ASANA_PROJECT_GID_CACHE;
-  if (!ASANA_WORKSPACE_GID) {
-    throw new Error("ASANA_PROJECT_GID is not set and ASANA_WORKSPACE_GID is unavailable.");
+  const tryMatchInWorkspace = async (workspaceGid) => {
+    const data = await asanaRequest("GET", `/workspaces/${workspaceGid}/projects`, {
+      query: {
+        limit: 100,
+        archived: "false",
+        opt_fields: "gid,name",
+      },
+    });
+    const projects = Array.isArray(data?.data) ? data.data : [];
+    const match = projects.find((p) => String(p?.name || "").trim().toLowerCase() === ASANA_PROJECT_NAME.toLowerCase());
+    return match?.gid ? String(match.gid) : "";
+  };
+
+  if (ASANA_WORKSPACE_GID) {
+    const gid = await tryMatchInWorkspace(ASANA_WORKSPACE_GID);
+    if (gid) {
+      ASANA_PROJECT_GID_CACHE = gid;
+      return ASANA_PROJECT_GID_CACHE;
+    }
   }
 
-  const data = await asanaRequest("GET", `/workspaces/${ASANA_WORKSPACE_GID}/projects`, {
-    query: {
-      limit: 100,
-      archived: "false",
-      opt_fields: "gid,name",
-    },
+  // Fallback: discover workspace automatically from token access.
+  const workspacesRes = await asanaRequest("GET", "/workspaces", {
+    query: { limit: 100, opt_fields: "gid,name" },
   });
-
-  const projects = Array.isArray(data?.data) ? data.data : [];
-  const match = projects.find((p) => String(p?.name || "").trim().toLowerCase() === ASANA_PROJECT_NAME.toLowerCase());
-  if (!match?.gid) {
-    throw new Error(`Project '${ASANA_PROJECT_NAME}' not found in workspace ${ASANA_WORKSPACE_GID}.`);
+  const workspaces = Array.isArray(workspacesRes?.data) ? workspacesRes.data : [];
+  for (const ws of workspaces) {
+    const gid = await tryMatchInWorkspace(String(ws?.gid || ""));
+    if (gid) {
+      ASANA_PROJECT_GID_CACHE = gid;
+      return ASANA_PROJECT_GID_CACHE;
+    }
   }
-  ASANA_PROJECT_GID_CACHE = String(match.gid);
-  return ASANA_PROJECT_GID_CACHE;
+
+  const wsHint = ASANA_WORKSPACE_GID ? ` workspace ${ASANA_WORKSPACE_GID}` : " any accessible workspace";
+  throw new Error(`Project '${ASANA_PROJECT_NAME}' not found in${wsHint}.`);
 }
 
 async function listAsanaTasks(status = "current", limit = ASANA_TASK_LIST_LIMIT) {
@@ -473,6 +512,193 @@ async function markAsanaTaskDone(taskGid) {
     body: { data: { completed: true } },
   });
   return res?.data || null;
+}
+
+async function ensureAsanaOverdueStateLoaded() {
+  if (ASANA_OVERDUE_STATE_LOADED) return;
+  try {
+    const raw = await fs.readFile(ASANA_OVERDUE_STATE_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      ASANA_OVERDUE_STATE.task_levels = parsed.task_levels && typeof parsed.task_levels === "object"
+        ? parsed.task_levels
+        : {};
+      ASANA_OVERDUE_STATE.task_notified_at = parsed.task_notified_at && typeof parsed.task_notified_at === "object"
+        ? parsed.task_notified_at
+        : {};
+    }
+  } catch {
+    // file may not exist yet
+  }
+  ASANA_OVERDUE_STATE_LOADED = true;
+}
+
+async function saveAsanaOverdueState() {
+  await fs.mkdir(path.dirname(ASANA_OVERDUE_STATE_FILE), { recursive: true });
+  await fs.writeFile(ASANA_OVERDUE_STATE_FILE, JSON.stringify(ASANA_OVERDUE_STATE, null, 2), "utf8");
+}
+
+function isOverdueSection(task) {
+  const section = String(task?.memberships?.[0]?.section?.name || "").trim().toLowerCase();
+  if (!section) return false;
+  return ASANA_OVERDUE_SECTION_NAMES.includes(section);
+}
+
+function toUtcDayTimestamp(v) {
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return 0;
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
+function getTaskDueDate(task) {
+  if (task?.due_on) return String(task.due_on);
+  if (task?.due_at) return String(task.due_at).slice(0, 10);
+  return "";
+}
+
+function getOverdueDays(task, now = new Date()) {
+  const due = getTaskDueDate(task);
+  if (!due) return -1;
+  const dueDay = toUtcDayTimestamp(due);
+  const nowDay = toUtcDayTimestamp(now.toISOString());
+  if (!dueDay || !nowDay) return -1;
+  const diffDays = Math.floor((nowDay - dueDay) / (24 * 60 * 60 * 1000));
+  return diffDays;
+}
+
+function getOverdueLevel(daysOverdue) {
+  if (daysOverdue < 0) return -1;
+  let level = -1;
+  for (let i = 0; i < ASANA_OVERDUE_THRESHOLDS.length; i += 1) {
+    if (daysOverdue >= ASANA_OVERDUE_THRESHOLDS[i]) level = i;
+  }
+  return level;
+}
+
+function getOverdueSeverity(daysOverdue) {
+  if (daysOverdue >= 7) return "critical";
+  if (daysOverdue >= 2) return "high";
+  if (daysOverdue >= 0) return "warning";
+  return "normal";
+}
+
+function formatOverdueTaskLine(task, daysOverdue, idx) {
+  const title = task?.name || "(untitled)";
+  const gid = task?.gid || "n/a";
+  const due = getTaskDueDate(task) || "no due date";
+  const assignee = task?.assignee?.name ? `@${task.assignee.name}` : "unassigned";
+  const section = task?.memberships?.[0]?.section?.name || "unknown";
+  const sev = getOverdueSeverity(daysOverdue).toUpperCase();
+  return `${idx + 1}. [${sev}] ${title} — overdue ${daysOverdue}d (due ${due}) · ${assignee} · #${section} (id: ${gid})`;
+}
+
+function buildOverdueReport(tasks) {
+  if (!tasks.length) return "✅ No overdue tasks found in Asana sections To Do / Doing.";
+  const lines = tasks.map((x, i) => formatOverdueTaskLine(x.task, x.daysOverdue, i));
+  return (
+    `⏰ Asana overdue alert (${ASANA_PROJECT_NAME})\n` +
+    `Sections: ${ASANA_OVERDUE_SECTION_NAMES.join(", ")}\n` +
+    `Thresholds: ${ASANA_OVERDUE_THRESHOLDS.join(", ")} days\n\n` +
+    lines.join("\n")
+  );
+}
+
+async function resolveAsanaAlertChatIds() {
+  if (ASANA_OVERDUE_ALERT_CHAT_IDS.length) return ASANA_OVERDUE_ALERT_CHAT_IDS;
+  if (ALLOWED_CHAT_IDS.size) return [...ALLOWED_CHAT_IDS.values()];
+  await ensureChatHistoryLoaded();
+  return [...CHAT_HISTORY_BY_CHAT.keys()];
+}
+
+async function collectOverdueAsanaTasks(limit = ASANA_OVERDUE_MAX_TASKS) {
+  const tasks = await listAsanaTasks("current", limit);
+  const out = [];
+  const now = new Date();
+  for (const t of tasks) {
+    if (!isOverdueSection(t)) continue;
+    const daysOverdue = getOverdueDays(t, now);
+    if (daysOverdue < 0) continue;
+    const level = getOverdueLevel(daysOverdue);
+    if (level < 0) continue;
+    out.push({ task: t, daysOverdue, level });
+  }
+  out.sort((a, b) => b.daysOverdue - a.daysOverdue || Date.parse(a.task?.due_on || a.task?.due_at || "9999-12-31") - Date.parse(b.task?.due_on || b.task?.due_at || "9999-12-31"));
+  return out;
+}
+
+async function runAsanaOverdueCheck(bot, { force = false, targetChatId = "" } = {}) {
+  if (!ASANA_OVERDUE_ENABLED) return { sent: 0, total: 0, reason: "disabled" };
+  if (!isAsanaConfigured()) return { sent: 0, total: 0, reason: asanaConfigHint() };
+
+  await ensureAsanaOverdueStateLoaded();
+  const overdue = await collectOverdueAsanaTasks(ASANA_OVERDUE_MAX_TASKS);
+  const reportRows = [];
+  for (const row of overdue) {
+    const gid = String(row.task?.gid || "");
+    if (!gid) continue;
+    const prevLevel = Number(ASANA_OVERDUE_STATE.task_levels[gid] ?? -1);
+    const shouldNotify = force || row.level > prevLevel;
+    if (shouldNotify) {
+      reportRows.push(row);
+      ASANA_OVERDUE_STATE.task_levels[gid] = row.level;
+      ASANA_OVERDUE_STATE.task_notified_at[gid] = Date.now();
+    }
+  }
+
+  // Keep state clean for tasks that are no longer overdue/current.
+  const activeGids = new Set(overdue.map((r) => String(r.task?.gid || "")).filter(Boolean));
+  for (const gid of Object.keys(ASANA_OVERDUE_STATE.task_levels)) {
+    if (!activeGids.has(gid)) {
+      delete ASANA_OVERDUE_STATE.task_levels[gid];
+      delete ASANA_OVERDUE_STATE.task_notified_at[gid];
+    }
+  }
+  await saveAsanaOverdueState();
+
+  if (!reportRows.length && !force) {
+    return { sent: 0, total: overdue.length, reason: "no_new_threshold_crossings" };
+  }
+
+  const message = buildOverdueReport(force ? overdue : reportRows);
+  const targets = targetChatId ? [String(targetChatId)] : await resolveAsanaAlertChatIds();
+  if (!targets.length) {
+    return { sent: 0, total: overdue.length, reason: "no_target_chats_configured" };
+  }
+
+  let sent = 0;
+  for (const chatId of targets) {
+    try {
+      await bot.telegram.sendMessage(chatId, trimOut(message), { disable_web_page_preview: true });
+      sent += 1;
+    } catch (e) {
+      console.log(`asana overdue send failed chat=${chatId}: ${e?.message || String(e)}`);
+    }
+  }
+  return { sent, total: overdue.length, reason: sent ? "ok" : "send_failed" };
+}
+
+function startAsanaOverdueMonitor(bot) {
+  if (!ASANA_OVERDUE_ENABLED) return;
+  const everyMs = Math.max(5, ASANA_OVERDUE_INTERVAL_MINUTES) * 60 * 1000;
+
+  const runner = async () => {
+    try {
+      const res = await runAsanaOverdueCheck(bot, { force: false });
+      if (res.reason !== "no_new_threshold_crossings") {
+        console.log(`asana overdue check: sent=${res.sent} total=${res.total} reason=${res.reason}`);
+      }
+      ASANA_OVERDUE_LAST_ERROR_TS = 0;
+    } catch (e) {
+      const now = Date.now();
+      if (!ASANA_OVERDUE_LAST_ERROR_TS || now - ASANA_OVERDUE_LAST_ERROR_TS > ASANA_OVERDUE_ERROR_COOLDOWN_MS) {
+        console.log(`asana overdue monitor error: ${e?.message || String(e)}`);
+        ASANA_OVERDUE_LAST_ERROR_TS = now;
+      }
+    }
+  };
+
+  setTimeout(runner, Math.max(0, ASANA_OVERDUE_STARTUP_DELAY_MS));
+  setInterval(runner, everyMs);
 }
 
 function normalizeQuestionText(raw) {
@@ -1752,8 +1978,10 @@ async function main() {
         "/tasks [current|done|all] — list Asana tasks from General Tasks\n" +
         "/task_add <title> [due:YYYY-MM-DD] — create Asana task\n" +
         "/task_done <task_id> — mark Asana task as completed\n" +
+        "/overdue_check [all] — run overdue check for To Do/Doing now\n" +
         "/transcript <title> — get meeting transcript\n" +
         "/ask <question> — ask in groups (works even with privacy mode)\n" +
+        "Overdue thresholds (days): " + ASANA_OVERDUE_THRESHOLDS.join(", ") + "\n" +
         "Tip: ask 'weekly trends' for a 7-day summary.\n" +
         "Or just send a free-form question.",
     );
@@ -1847,6 +2075,26 @@ async function main() {
     }
   });
 
+  bot.command("overdue_check", async (ctx) => {
+    ctx.state.handledCommand = true;
+    if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
+    const txt = (ctx.message?.text || "").trim();
+    const force = /\b(all|full|force)\b/i.test(txt);
+    try {
+      const res = await runAsanaOverdueCheck(bot, {
+        force,
+        targetChatId: String(ctx.chat?.id || ""),
+      });
+      const status =
+        res.reason === "ok"
+          ? `Overdue check sent (${res.sent} chat(s), ${res.total} overdue task(s)).`
+          : `Overdue check finished: ${res.reason} (${res.total} overdue task(s)).`;
+      await ctx.reply(status);
+    } catch (e) {
+      await ctx.reply(`Overdue check error: ${e?.message || String(e)}`);
+    }
+  });
+
   bot.command("ask", async (ctx) => {
     ctx.state.handledCommand = true;
     if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
@@ -1905,8 +2153,10 @@ async function main() {
             "/tasks [current|done|all] — list Asana tasks from General Tasks\n" +
             "/task_add <title> [due:YYYY-MM-DD] — create Asana task\n" +
             "/task_done <task_id> — mark Asana task as completed\n" +
+            "/overdue_check [all] — run overdue check for To Do/Doing now\n" +
             "/transcript <title> — get meeting transcript\n" +
             "/ask <question> — ask in groups (works even with privacy mode)\n" +
+            "Overdue thresholds (days): " + ASANA_OVERDUE_THRESHOLDS.join(", ") + "\n" +
             "Tip: ask 'weekly trends' for a 7-day summary.\n" +
             "Or just send a free-form question.",
         );
@@ -1990,6 +2240,24 @@ async function main() {
         return;
       }
 
+      if (/^\/overdue_check(?:@\w+)?(?:\s|$)/i.test(lower)) {
+        const force = /\b(all|full|force)\b/i.test(txt);
+        try {
+          const res = await runAsanaOverdueCheck(bot, {
+            force,
+            targetChatId: String(ctx.chat?.id || ""),
+          });
+          const status =
+            res.reason === "ok"
+              ? `Overdue check sent (${res.sent} chat(s), ${res.total} overdue task(s)).`
+              : `Overdue check finished: ${res.reason} (${res.total} overdue task(s)).`;
+          await ctx.reply(status);
+        } catch (e) {
+          await ctx.reply(`Overdue check error: ${e?.message || String(e)}`);
+        }
+        return;
+      }
+
       if (/^\/ask(?:@\w+)?(?:\s|$)/i.test(lower)) {
         const q = normalizeQuestionText(txt.replace(/^\/ask(?:@\w+)?\s*/i, ""));
         if (!q) {
@@ -2052,6 +2320,7 @@ async function main() {
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
 
+  startAsanaOverdueMonitor(bot);
   await bot.launch({ dropPendingUpdates: true });
   console.log("wagner-fellow-bot started");
 }
