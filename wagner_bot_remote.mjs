@@ -67,6 +67,8 @@ const ASANA_OVERDUE_STATE_FILE = process.env.ASANA_OVERDUE_STATE_FILE || path.jo
 const ASANA_OVERDUE_MAX_TASKS = parseInt(process.env.ASANA_OVERDUE_MAX_TASKS || "80", 10);
 const ASANA_OVERDUE_STARTUP_DELAY_MS = parseInt(process.env.ASANA_OVERDUE_STARTUP_SECONDS || "30", 10) * 1000;
 const ASANA_OVERDUE_ERROR_COOLDOWN_MS = parseInt(process.env.ASANA_OVERDUE_ERROR_COOLDOWN_MS || "21600000", 10);
+const ASANA_AUTO_ASSIGN_ENABLED = (process.env.ASANA_AUTO_ASSIGN_ENABLED || "1") === "1";
+const ASANA_ASSIGNEE_MAP_RAW = process.env.ASANA_ASSIGNEE_MAP || "";
 
 const MCP_TOOL_CACHE = {
   names: null,
@@ -77,12 +79,14 @@ const MCP_TOOL_CACHE_TTL_MS = 5 * 60 * 1000;
 let CHAT_HISTORY_LOADED = false;
 const CHAT_HISTORY_BY_CHAT = new Map();
 let ASANA_PROJECT_GID_CACHE = (process.env.ASANA_PROJECT_GID || "").trim();
+let ASANA_WORKSPACE_GID_CACHE = (ASANA_WORKSPACE_GID || "").trim();
 let ASANA_OVERDUE_STATE_LOADED = false;
 let ASANA_OVERDUE_LAST_ERROR_TS = 0;
 const ASANA_OVERDUE_STATE = {
   task_levels: {},
   task_notified_at: {},
 };
+let ASANA_USERS_CACHE = null;
 
 const ACCOUNT_PROFILE_HINT_TERMS = [
   "meta",
@@ -296,6 +300,47 @@ function asanaConfigHint() {
   return "";
 }
 
+function normalizePersonKey(v) {
+  return String(v || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}@._+\-\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseAsanaAssigneeMap(raw) {
+  const out = new Map();
+  const text = String(raw || "").trim();
+  if (!text) return out;
+  const pairs = text
+    .split(/[,;\n]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+  for (const pair of pairs) {
+    const m = pair.match(/^([^=:\-]+)\s*(?:=|:|->)\s*(.+)$/);
+    if (!m) continue;
+    const key = normalizePersonKey(m[1]);
+    const value = String(m[2] || "").trim();
+    if (!key || !value) continue;
+    out.set(key, value);
+  }
+  return out;
+}
+
+const DEFAULT_ASANA_ASSIGNEE_HINTS = new Map([
+  ["makar", "makar@love-medo.com"],
+  ["makar biziukin", "makar@love-medo.com"],
+  ["yaroslav", "yaroslav@love-medo.com"],
+  ["yaroslav love-medo", "yaroslav@love-medo.com"],
+  ["mitali", "mitali0115@gmail.com"],
+  ["mitali padhiyar", "mitali0115@gmail.com"],
+  ["mitali wagner", "mitali0115@gmail.com"],
+  ["sanjin", "sanjinbeckovic@gmail.com"],
+  ["sanjin beckovic", "sanjinbeckovic@gmail.com"],
+  ["darya", "darya@love-medo.com"],
+]);
+const ASANA_ASSIGNEE_HINTS = parseAsanaAssigneeMap(ASANA_ASSIGNEE_MAP_RAW);
+
 function asanaApiUrl(pathname, query = {}) {
   const base = ASANA_API_BASE.endsWith("/") ? ASANA_API_BASE.slice(0, -1) : ASANA_API_BASE;
   const cleanPath = pathname.startsWith("/") ? pathname : `/${pathname}`;
@@ -342,6 +387,105 @@ async function asanaRequest(method, pathname, { query = {}, body = null } = {}) 
     throw new Error(`Asana API error: ${errMsg}`);
   }
   return data;
+}
+
+async function resolveAsanaWorkspaceGid() {
+  if (ASANA_WORKSPACE_GID_CACHE) return ASANA_WORKSPACE_GID_CACHE;
+  const me = await asanaRequest("GET", "/users/me", {
+    query: { opt_fields: "workspaces.gid,workspaces.name" },
+  });
+  const ws = Array.isArray(me?.data?.workspaces) ? me.data.workspaces : [];
+  const first = ws[0]?.gid ? String(ws[0].gid) : "";
+  if (!first) throw new Error("Unable to resolve Asana workspace from token.");
+  ASANA_WORKSPACE_GID_CACHE = first;
+  return ASANA_WORKSPACE_GID_CACHE;
+}
+
+function buildAsanaUserIndex(users) {
+  const byGid = new Map();
+  const byToken = new Map();
+  const pushToken = (token, user) => {
+    const k = normalizePersonKey(token);
+    if (!k) return;
+    if (!byToken.has(k)) byToken.set(k, user);
+  };
+
+  for (const user of users || []) {
+    const gid = String(user?.gid || "").trim();
+    if (!gid) continue;
+    const entry = {
+      gid,
+      name: String(user?.name || "").trim(),
+      email: String(user?.email || "").trim(),
+    };
+    byGid.set(gid, entry);
+    pushToken(entry.gid, entry);
+    pushToken(entry.name, entry);
+    pushToken(entry.email, entry);
+    const parts = entry.name.split(/\s+/).filter(Boolean);
+    if (parts[0]) pushToken(parts[0], entry);
+    if (parts.length >= 2) pushToken(`${parts[0]} ${parts[parts.length - 1]}`, entry);
+  }
+  return { byGid, byToken };
+}
+
+async function loadAsanaUsersIndex() {
+  if (ASANA_USERS_CACHE) return ASANA_USERS_CACHE;
+  const workspaceGid = await resolveAsanaWorkspaceGid();
+  const users = [];
+  let offset = "";
+  let page = 0;
+  while (page < 8) {
+    page += 1;
+    const data = await asanaRequest("GET", `/workspaces/${workspaceGid}/users`, {
+      query: {
+        limit: 100,
+        offset,
+        opt_fields: "gid,name,email",
+      },
+    });
+    const chunk = Array.isArray(data?.data) ? data.data : [];
+    users.push(...chunk);
+    const nextOffset = data?.next_page?.offset;
+    if (!nextOffset) break;
+    offset = nextOffset;
+  }
+  ASANA_USERS_CACHE = buildAsanaUserIndex(users);
+  return ASANA_USERS_CACHE;
+}
+
+function resolveAssigneeHint(ownerRaw) {
+  const owner = normalizePersonKey(ownerRaw);
+  if (!owner) return "";
+  if (ASANA_ASSIGNEE_HINTS.has(owner)) return ASANA_ASSIGNEE_HINTS.get(owner);
+  if (DEFAULT_ASANA_ASSIGNEE_HINTS.has(owner)) return DEFAULT_ASANA_ASSIGNEE_HINTS.get(owner);
+  const first = owner.split(/\s+/)[0] || "";
+  if (first && ASANA_ASSIGNEE_HINTS.has(first)) return ASANA_ASSIGNEE_HINTS.get(first);
+  if (first && DEFAULT_ASANA_ASSIGNEE_HINTS.has(first)) return DEFAULT_ASANA_ASSIGNEE_HINTS.get(first);
+  return ownerRaw;
+}
+
+async function resolveAsanaAssignee(ownerRaw) {
+  const owner = String(ownerRaw || "").trim();
+  if (!ASANA_AUTO_ASSIGN_ENABLED || !owner) return null;
+
+  const hints = resolveAssigneeHint(owner);
+  const index = await loadAsanaUsersIndex();
+  const candidates = [
+    hints,
+    owner,
+    normalizePersonKey(hints),
+    normalizePersonKey(owner),
+    normalizePersonKey(owner).split(/\s+/)[0] || "",
+  ].filter(Boolean);
+
+  for (const c of candidates) {
+    const k = normalizePersonKey(c);
+    if (!k) continue;
+    const hit = index.byToken.get(k);
+    if (hit) return hit;
+  }
+  return null;
 }
 
 async function resolveAsanaProjectGid() {
@@ -493,17 +637,27 @@ async function createAsanaTask(rawText) {
 
   const dueMatch = text.match(/\s+due:(\d{4}-\d{2}-\d{2})\s*$/i);
   const dueOn = dueMatch ? dueMatch[1] : "";
-  const title = dueMatch ? text.replace(/\s+due:\d{4}-\d{2}-\d{2}\s*$/i, "").trim() : text;
+  const titleRaw = dueMatch ? text.replace(/\s+due:\d{4}-\d{2}-\d{2}\s*$/i, "").trim() : text;
+  const ownerSplit = splitOwnerPrefix(titleRaw);
+  const assignee = ownerSplit.owner ? await resolveAsanaAssignee(ownerSplit.owner) : null;
+  const title = ownerSplit.title || titleRaw;
   if (!title) throw new Error("Task title is empty.");
 
   return createAsanaTaskWithFields({
     projectGid,
     name: title,
     dueOn,
+    assigneeGid: assignee?.gid || "",
   });
 }
 
-async function createAsanaTaskWithFields({ projectGid = "", name = "", notes = "", dueOn = "" } = {}) {
+async function createAsanaTaskWithFields({
+  projectGid = "",
+  name = "",
+  notes = "",
+  dueOn = "",
+  assigneeGid = "",
+} = {}) {
   const effectiveProject = projectGid || await resolveAsanaProjectGid();
   const title = String(name || "").trim();
   if (!title) throw new Error("Task title is empty.");
@@ -513,6 +667,7 @@ async function createAsanaTaskWithFields({ projectGid = "", name = "", notes = "
       projects: [effectiveProject],
       ...(notes ? { notes: String(notes).trim() } : {}),
       ...(dueOn ? { due_on: dueOn } : {}),
+      ...(assigneeGid ? { assignee: String(assigneeGid) } : {}),
     },
   };
   const res = await asanaRequest("POST", "/tasks", { body: payload });
@@ -804,6 +959,13 @@ function buildShortAsanaTaskTitle(item) {
   return finalizeAsanaTitle(core);
 }
 
+function splitOwnerPrefix(text) {
+  const raw = String(text || "").trim();
+  const m = raw.match(/^([A-Za-z][A-Za-z .'-]{1,40})\s*:\s*(.+)$/);
+  if (!m) return { owner: "", title: raw };
+  return { owner: m[1].trim(), title: String(m[2] || "").trim() };
+}
+
 async function summarizeAsanaTaskTitles(items) {
   const src = Array.isArray(items) ? items : [];
   if (!src.length) return [];
@@ -1051,13 +1213,19 @@ async function importActionItemsToAsanaFromContext({ question = "", chatId = "",
       item.owner ? `Owner: ${item.owner}` : "",
     ].filter(Boolean).join("\n");
 
-    const task = await createAsanaTaskWithFields({ name: asanaTitle, notes });
+    const assignee = await resolveAsanaAssignee(item.owner);
+    const task = await createAsanaTaskWithFields({
+      name: asanaTitle,
+      notes,
+      assigneeGid: assignee?.gid || "",
+    });
     created += 1;
     existingSet.add(normalizedTitle);
     existingCoreSet.add(normalizedCore);
     if (normalizedOriginal) existingCoreSet.add(normalizedOriginal);
     if (stem) existingStemSet.add(stem);
-    createdLines.push(`- ${task?.name || asanaTitle}`);
+    const assigneeLabel = assignee?.name || (item.owner ? String(item.owner) : "");
+    createdLines.push(`- ${task?.name || asanaTitle}${assigneeLabel ? ` — ${assigneeLabel}` : ""}`);
   }
 
   const header = `✅ Action items synced to Asana board: ${ASANA_PROJECT_NAME}`;
