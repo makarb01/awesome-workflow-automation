@@ -220,10 +220,17 @@ async function tryNativeFellowAi(question, options = {}) {
   const requestedCalls = Number.isInteger(options.requestedCalls) ? options.requestedCalls : null;
   const focusTerms = Array.isArray(options.focusTerms) ? options.focusTerms : [];
   const chatHistoryContext = String(options.chatHistoryContext || "").trim();
+  const mode = String(options.mode || "concise");
 
   const scopeHint = [
     requestedCalls ? `Limit analysis to last ${requestedCalls} calls.` : "",
     focusTerms.length ? `Focus strictly on: ${focusTerms.join(", ")}.` : "",
+    mode === "detailed_summary"
+      ? "Provide a full detailed summary with sections: discussion points, decisions, action items, blockers, next steps."
+      : "",
+    mode === "coordinator"
+      ? "Answer as an operational coordinator: include current tasks, open issues, blockers, actions."
+      : "",
     chatHistoryContext ? `Use this recent chat history context when relevant:\n${chatHistoryContext}` : "",
   ].filter(Boolean).join(" ");
   const fullQuestion = scopeHint ? `${question}\n\nContext instructions: ${scopeHint}` : question;
@@ -399,6 +406,43 @@ function formatAsanaTaskList(tasks, heading) {
   if (!tasks.length) return `${heading}\nNo tasks found.`;
   const lines = tasks.map((t, i) => formatAsanaTaskLine(t, i));
   return `${heading}\n${lines.join("\n")}`;
+}
+
+async function buildAsanaSnapshotContext(question, mode = "concise") {
+  if (!ENABLE_ASANA) return "";
+  const q = String(question || "").toLowerCase();
+  const needed =
+    mode === "coordinator" ||
+    /\b(asana|task|tasks|board|open issues|blocker|action items|current tasks|done tasks)\b/.test(q);
+  if (!needed) return "";
+
+  if (!isAsanaConfigured()) {
+    return `Asana snapshot: unavailable (${asanaConfigHint()})`;
+  }
+
+  try {
+    const currentLimit = mode === "coordinator" ? 12 : 8;
+    const doneLimit = mode === "coordinator" ? 8 : 5;
+    const [current, done] = await Promise.all([
+      listAsanaTasks("current", currentLimit),
+      listAsanaTasks("done", doneLimit),
+    ]);
+
+    const currentLines = current.length
+      ? current.map((t, i) => formatAsanaTaskLine(t, i)).join("\n")
+      : "No current tasks.";
+    const doneLines = done.length
+      ? done.map((t, i) => formatAsanaTaskLine(t, i)).join("\n")
+      : "No recently completed tasks.";
+
+    return (
+      `Asana board snapshot (${ASANA_PROJECT_NAME}):\n` +
+      `Current tasks:\n${currentLines}\n\n` +
+      `Recently done tasks:\n${doneLines}`
+    );
+  } catch (e) {
+    return `Asana snapshot: unavailable (${e?.message || String(e)})`;
+  }
 }
 
 async function createAsanaTask(rawText) {
@@ -859,8 +903,6 @@ function looksLikeWeeklyTrendsQuestion(q) {
   return (
     t.includes("trend") ||
     t.includes("theme") ||
-    t.includes("summary") ||
-    t.includes("summarize") ||
     t.includes("last week") ||
     t.includes("this week") ||
     t.includes("past week") ||
@@ -1023,6 +1065,64 @@ function looksLikeStatusQuestion(q) {
   );
 }
 
+function looksLikeSummaryQuestion(q) {
+  const t = (q || "").toLowerCase();
+  return (
+    t.includes("summarize") ||
+    t.includes("summary") ||
+    t.includes("recap") ||
+    t.includes("minutes") ||
+    t.includes("meeting notes") ||
+    t.includes("what happened")
+  );
+}
+
+function looksLikeDetailedSummaryRequest(q) {
+  const t = (q || "").toLowerCase();
+  return (
+    looksLikeSummaryQuestion(t) ||
+    t.includes("full") ||
+    t.includes("detailed") ||
+    t.includes("complete") ||
+    t.includes("everything") ||
+    t.includes("all details")
+  );
+}
+
+function looksLikeOperationalCoordinatorQuestion(q) {
+  const t = (q || "").toLowerCase();
+  return (
+    t.includes("open issues") ||
+    t.includes("issues") ||
+    t.includes("blocker") ||
+    t.includes("action items") ||
+    t.includes("actions") ||
+    t.includes("current tasks") ||
+    t.includes("done tasks") ||
+    t.includes("asana") ||
+    t.includes("board") ||
+    t.includes("operational coordinator") ||
+    t.includes("ops")
+  );
+}
+
+function mentionsToday(q) {
+  const t = (q || "").toLowerCase();
+  return t.includes("today") || t.includes("сегодня");
+}
+
+function isTodayMeeting(meeting) {
+  const ts = parseMeetingTime(meeting);
+  if (!ts) return false;
+  const d = new Date(ts);
+  const now = new Date();
+  return (
+    d.getUTCFullYear() === now.getUTCFullYear() &&
+    d.getUTCMonth() === now.getUTCMonth() &&
+    d.getUTCDate() === now.getUTCDate()
+  );
+}
+
 function formatMeetingsList(meetings, limit = 5) {
   return meetings.slice(0, limit).map((m, i) => {
     const when = m?.event_start_local || m?.event_start || "N/A";
@@ -1064,6 +1164,7 @@ async function buildMeetingEvidence(meeting, options = {}) {
   if (!meeting) return { text: "", snapshot: null, matchCount: 0 };
   const includeTranscript = !!options.includeTranscript;
   const focusTerms = Array.isArray(options.focusTerms) ? options.focusTerms : [];
+  const detailedMode = !!options.detailedMode;
   const title = meeting?.title || "(untitled)";
   const when = meeting?.event_start_local || meeting?.event_start || "N/A";
   const stableId = String(meeting?.id || meeting?.note_id || `${title}|${when}`);
@@ -1083,7 +1184,7 @@ async function buildMeetingEvidence(meeting, options = {}) {
     }
   }
 
-  const summaryForLlm = summaryToHighlights(summary);
+  const summaryForLlm = summaryToHighlights(summary, detailedMode ? 28 : 12);
   const summaryFocused = pickFocusedLines(summaryForLlm, focusTerms, 5);
   const actionsFocused = pickFocusedLines(actions, focusTerms, 5);
   const transcriptFocused = pickTranscriptMatches(transcript, focusTerms, 3);
@@ -1110,9 +1211,9 @@ async function buildMeetingEvidence(meeting, options = {}) {
       }
     }
   } else {
-    if (summaryForLlm) parts.push(`Summary:\n${clipText(summaryForLlm, 2200)}`);
-    if (actions) parts.push(`Action items:\n${clipText(actions, 1800)}`);
-    if (transcript) parts.push(`Transcript excerpt:\n${clipText(transcript, 2500)}`);
+    if (summaryForLlm) parts.push(`Summary:\n${clipText(summaryForLlm, detailedMode ? 3600 : 2200)}`);
+    if (actions) parts.push(`Action items:\n${clipText(actions, detailedMode ? 2600 : 1800)}`);
+    if (transcript) parts.push(`Transcript excerpt:\n${clipText(transcript, detailedMode ? 3200 : 2500)}`);
   }
 
   return {
@@ -1138,11 +1239,31 @@ async function synthesizeAnswerWithGemini(
   if (!ENABLE_LLM_SYNTHESIS || !GEMINI_API_KEY) return "";
   const focusTerms = Array.isArray(options.focusTerms) ? options.focusTerms : [];
   const requestedCalls = Number.isInteger(options.requestedCalls) ? options.requestedCalls : null;
+  const mode = String(options.mode || "concise");
+  const contextCap = mode === "concise" ? MAX_CONTEXT_CHARS : Math.max(MAX_CONTEXT_CHARS, 22000);
   const context = clipText(
     (contextBlocks || []).filter(Boolean).join("\n\n--------------------\n\n"),
-    MAX_CONTEXT_CHARS,
+    contextCap,
   );
   if (!context) return "";
+
+  const modeInstruction =
+    mode === "detailed_summary"
+      ? (
+          "You are an operational meeting coordinator. " +
+          "Provide a full, detailed summary. " +
+          "Format with sections: Scope, Key discussion points, Decisions, Action items, Open issues/blockers, Next steps. " +
+          "Do not omit meaningful details if they are present in context.\n"
+        )
+      : mode === "coordinator"
+        ? (
+            "You are an operational coordinator. " +
+            "Combine meeting notes, chat history and Asana snapshot into one execution-focused report. " +
+            "Format with sections: Current tasks, Open issues, Blockers, Action items, Risks/dependencies, Recommended next actions.\n"
+          )
+        : (
+            "Provide a concise analytical answer focused on the question.\n"
+          );
 
   const prompt =
     "You are an expert meeting analyst for business calls.\n" +
@@ -1159,8 +1280,12 @@ async function synthesizeAnswerWithGemini(
       : "") +
     "Always anchor statements with meeting title/date when possible.\n" +
     "If data is insufficient, explicitly say what is missing.\n" +
-    "Output format: 3-5 short bullets (each <= 22 words), then one short conclusion sentence.\n" +
-    "Prefer concrete issues over generic themes.\n\n" +
+    modeInstruction +
+    (
+      mode === "concise"
+        ? "Output format: 3-5 short bullets (each <= 22 words), then one short conclusion sentence.\nPrefer concrete issues over generic themes.\n\n"
+        : "Be specific and concrete. Include owners and due dates if present. Add a short final executive takeaway.\n\n"
+    ) +
     `User question:\n${question}\n\n` +
     (chatMemoryContext ? `Recent chat memory:\n${chatMemoryContext}\n\n` : "") +
     (chatHistoryContext ? `Recent chat history (last messages):\n${chatHistoryContext}\n\n` : "") +
@@ -1175,7 +1300,7 @@ async function synthesizeAnswerWithGemini(
     generationConfig: {
       temperature: 0.2,
       topP: 0.9,
-      maxOutputTokens: 700,
+      maxOutputTokens: mode === "concise" ? 700 : 1300,
       thinkingConfig: {
         thinkingBudget: 0,
       },
@@ -1212,7 +1337,11 @@ async function synthesizeAnswerWithGemini(
 
   const repairPrompt =
     "Rewrite the draft into a complete answer in English.\n" +
-    "Rules: 3-5 short bullets + 1 short conclusion sentence.\n" +
+    (
+      mode === "concise"
+        ? "Rules: 3-5 short bullets + 1 short conclusion sentence.\n"
+        : "Rules: keep full detail and preserve structure. Use clear sections and complete sentences.\n"
+    ) +
     "Do not quote notes verbatim. Do not add new facts.\n\n" +
     `User question:\n${question}\n\n` +
     `Draft answer:\n${answer}`;
@@ -1221,7 +1350,7 @@ async function synthesizeAnswerWithGemini(
     contents: [{ role: "user", parts: [{ text: repairPrompt }] }],
     generationConfig: {
       temperature: 0.1,
-      maxOutputTokens: 320,
+      maxOutputTokens: mode === "concise" ? 320 : 700,
       thinkingConfig: {
         thinkingBudget: 0,
       },
@@ -1255,11 +1384,17 @@ async function answerQuestion(question, chatId = "") {
     return "Empty query. Ask a question about Fellow meetings.";
   }
 
+  const detailedSummaryRequested = looksLikeDetailedSummaryRequest(safeQuestion);
+  const coordinatorRequested = looksLikeOperationalCoordinatorQuestion(safeQuestion);
+  const todayRequested = mentionsToday(safeQuestion);
+  const responseMode = coordinatorRequested
+    ? "coordinator"
+    : (detailedSummaryRequested ? "detailed_summary" : "concise");
   const requestedCalls = parseRequestedCallCount(safeQuestion) || (asksForRecentCalls(safeQuestion) ? 5 : null);
   const focusTerms = buildFocusTerms(safeQuestion);
   const transcriptRequested = looksLikeTranscriptRequest(safeQuestion);
   const wantsQuotedEvidence = /\b(quote|quoted|verbatim|exact|where was|who said)\b/i.test(safeQuestion);
-  const meetingFetchLimit = Math.max(30, (requestedCalls || 5) + 16);
+  const meetingFetchLimit = Math.max(40, (requestedCalls || 6) + 20);
   const chatHistoryContext = await getChatHistoryContext(chatId, safeQuestion);
 
   try {
@@ -1267,6 +1402,7 @@ async function answerQuestion(question, chatId = "") {
       requestedCalls,
       focusTerms,
       chatHistoryContext,
+      mode: responseMode,
     });
     if (nativeAnswer) return trimOut(nativeAnswer);
   } catch (e) {
@@ -1285,6 +1421,14 @@ async function answerQuestion(question, chatId = "") {
   if (requestedCalls) {
     const base = rankedMeetings.length ? sortMeetingsByDateDesc(rankedMeetings) : allMeetings;
     selectedMeetings = base.slice(0, requestedCalls);
+  } else if (detailedSummaryRequested) {
+    const rankedBase = rankedMeetings.length ? sortMeetingsByDateDesc(rankedMeetings) : allMeetings;
+    const todaySubset = todayRequested ? rankedBase.filter((m) => isTodayMeeting(m)) : [];
+    const source = todaySubset.length ? todaySubset : rankedBase;
+    selectedMeetings = source.slice(0, todayRequested ? 1 : 2);
+  } else if (coordinatorRequested) {
+    const base = rankedMeetings.length ? sortMeetingsByDateDesc(rankedMeetings) : allMeetings;
+    selectedMeetings = base.slice(0, 6);
   } else if (focusTerms.length) {
     const base = rankedMeetings.length ? rankedMeetings : allMeetings;
     selectedMeetings = sortMeetingsByDateDesc(base).slice(0, 5);
@@ -1339,6 +1483,10 @@ async function answerQuestion(question, chatId = "") {
   if (chatHistoryContext) {
     contextBlocks.push(`Recent chat history context:\n${clipText(chatHistoryContext, 2200)}`);
   }
+  const asanaSnapshot = await buildAsanaSnapshotContext(safeQuestion, responseMode);
+  if (asanaSnapshot) {
+    contextBlocks.push(asanaSnapshot);
+  }
 
   try {
     const bankCtx = await buildMemoryBankContext(
@@ -1352,11 +1500,14 @@ async function answerQuestion(question, chatId = "") {
   }
 
   const shouldPullTranscriptEvidence =
-    focusTerms.length > 0 &&
-    /(account|profile|meta|business manager|bm|ad account|pixel|page)/i.test(safeQuestion) &&
-    wantsQuotedEvidence;
+    (
+      (focusTerms.length > 0 &&
+        /(account|profile|meta|business manager|bm|ad account|pixel|page)/i.test(safeQuestion) &&
+        wantsQuotedEvidence) ||
+      detailedSummaryRequested
+    );
   const transcriptEvidenceLimit = shouldPullTranscriptEvidence
-    ? Math.max(1, Math.min(2, selectedMeetings.length))
+    ? Math.max(1, Math.min(detailedSummaryRequested ? 2 : 2, selectedMeetings.length))
     : 0;
 
   const freshSnapshots = [];
@@ -1366,6 +1517,7 @@ async function answerQuestion(question, chatId = "") {
     const evidence = await buildMeetingEvidence(m, {
       includeTranscript: i < transcriptEvidenceLimit,
       focusTerms,
+      detailedMode: detailedSummaryRequested || coordinatorRequested,
     });
     if (evidence?.text) contextBlocks.push(evidence.text);
     if (evidence?.snapshot) freshSnapshots.push(evidence.snapshot);
@@ -1392,7 +1544,7 @@ async function answerQuestion(question, chatId = "") {
         contextBlocks,
         memoryContext,
         chatHistoryContext,
-        { focusTerms, requestedCalls },
+        { focusTerms, requestedCalls, mode: responseMode },
       );
       if (synthesized) return trimOut(synthesized);
     } catch (e) {
@@ -1404,6 +1556,9 @@ async function answerQuestion(question, chatId = "") {
   if (!detectNoResults(cachedText) && cachedText) {
     blocks.push(`📚 Related notes:
 ${cachedText}`);
+  }
+  if (asanaSnapshot) {
+    blocks.push(`🗂 Asana:\n${clipText(asanaSnapshot, 1800)}`);
   }
 
   if (rankedMeetings.length) {
