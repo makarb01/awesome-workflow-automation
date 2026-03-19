@@ -302,15 +302,26 @@ function lineMatchScore(line, focusTerms) {
   const text = String(line || "").toLowerCase();
   if (!text) return 0;
   let score = 0;
+  let termHits = 0;
   for (const t of focusTerms || []) {
     if (!t) continue;
-    if (text.includes(t)) score += t.includes(" ") ? 3 : 2;
+    if (text.includes(t)) {
+      score += t.includes(" ") ? 3 : 2;
+      termHits += 1;
+    }
   }
-  if (/\b(issue|problem|blocked|cannot|can't|failed|error|rejected|restricted|disabled|suspended)\b/i.test(text)) {
+  if (/\b(account|profile|meta|business manager|bm|pixel|page|ad account)\b/i.test(text)) {
+    score += 2;
+    termHits += 1;
+  }
+  if (
+    termHits > 0 &&
+    /\b(issue|problem|blocked|cannot|can't|failed|error|rejected|restricted|disabled|suspended)\b/i.test(text)
+  ) {
     score += 2;
   }
-  if (/\b(account|profile|meta|business manager|bm|pixel|page)\b/i.test(text)) {
-    score += 2;
+  if ((focusTerms || []).length > 0 && termHits === 0) {
+    return 0;
   }
   return score;
 }
@@ -585,7 +596,8 @@ function tokenizeQueryTerms(q) {
   const stop = new Set([
     "what", "changed", "change", "current", "status", "update", "latest", "last", "calls", "call",
     "with", "about", "from", "this", "week", "meeting", "meetings", "show", "give", "please", "tell",
-    "the", "and", "for", "are", "was", "were", "how", "where", "when", "why", "who"
+    "the", "and", "for", "are", "was", "were", "how", "where", "when", "why", "who",
+    "main", "related", "issue", "issues"
   ]);
   return (q || "")
     .toLowerCase()
