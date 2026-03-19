@@ -40,6 +40,12 @@ const CHAT_HISTORY_CONTEXT_CHARS = parseInt(process.env.CHAT_HISTORY_CONTEXT_CHA
 const CHAT_HISTORY_MAX_TEXT = parseInt(process.env.CHAT_HISTORY_MAX_TEXT || "700", 10);
 const CHAT_HISTORY_FILE = process.env.CHAT_HISTORY_FILE || path.join(MEMORY_BANK_DIR, "chat-history.json");
 const CHAT_HISTORY_RELEVANT_LINES = parseInt(process.env.CHAT_HISTORY_RELEVANT_LINES || "40", 10);
+const ENABLE_ASANA = (process.env.ENABLE_ASANA || "1") === "1";
+const ASANA_API_BASE = process.env.ASANA_API_BASE || "https://app.asana.com/api/1.0";
+const ASANA_ACCESS_TOKEN = process.env.ASANA_ACCESS_TOKEN || process.env.ASANA_TOKEN || "";
+const ASANA_WORKSPACE_GID = process.env.ASANA_WORKSPACE_GID || "";
+const ASANA_PROJECT_NAME = process.env.ASANA_PROJECT_NAME || "General Tasks";
+const ASANA_TASK_LIST_LIMIT = parseInt(process.env.ASANA_TASK_LIST_LIMIT || "20", 10);
 
 const MCP_TOOL_CACHE = {
   names: null,
@@ -49,6 +55,7 @@ const MCP_TOOL_CACHE_TTL_MS = 5 * 60 * 1000;
 
 let CHAT_HISTORY_LOADED = false;
 const CHAT_HISTORY_BY_CHAT = new Map();
+let ASANA_PROJECT_GID_CACHE = (process.env.ASANA_PROJECT_GID || "").trim();
 
 const ACCOUNT_PROFILE_HINT_TERMS = [
   "meta",
@@ -239,6 +246,189 @@ async function tryNativeFellowAi(question, options = {}) {
     }
   }
   return "";
+}
+
+function isAsanaConfigured() {
+  return ENABLE_ASANA && !!ASANA_ACCESS_TOKEN;
+}
+
+function asanaConfigHint() {
+  if (!ENABLE_ASANA) {
+    return "Asana integration is disabled (ENABLE_ASANA=0).";
+  }
+  if (!ASANA_ACCESS_TOKEN) {
+    return "Missing ASANA_ACCESS_TOKEN in .env.";
+  }
+  if (!ASANA_PROJECT_GID_CACHE && !ASANA_WORKSPACE_GID) {
+    return "Missing ASANA_PROJECT_GID (or ASANA_WORKSPACE_GID to resolve by project name).";
+  }
+  return "";
+}
+
+function asanaApiUrl(pathname, query = {}) {
+  const base = ASANA_API_BASE.endsWith("/") ? ASANA_API_BASE.slice(0, -1) : ASANA_API_BASE;
+  const cleanPath = pathname.startsWith("/") ? pathname : `/${pathname}`;
+  const url = new URL(`${base}${cleanPath}`);
+  for (const [k, v] of Object.entries(query || {})) {
+    if (v === undefined || v === null || v === "") continue;
+    url.searchParams.set(k, String(v));
+  }
+  return url;
+}
+
+async function asanaRequest(method, pathname, { query = {}, body = null } = {}) {
+  const hint = asanaConfigHint();
+  if (hint) throw new Error(hint);
+  const url = asanaApiUrl(pathname, query);
+  const init = {
+    method,
+    headers: {
+      Authorization: `Bearer ${ASANA_ACCESS_TOKEN}`,
+      Accept: "application/json",
+    },
+  };
+  if (body) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  const res = await withTimeout(fetch(url, init), 25000, `Asana ${method} ${pathname}`);
+  const text = await res.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = {};
+  }
+
+  if (!res.ok) {
+    const errMsg =
+      (data?.errors || []).map((e) => e?.message).filter(Boolean).join("; ") ||
+      `${res.status} ${res.statusText}`;
+    throw new Error(`Asana API error: ${errMsg}`);
+  }
+  if (Array.isArray(data?.errors) && data.errors.length) {
+    const errMsg = data.errors.map((e) => e?.message).filter(Boolean).join("; ");
+    throw new Error(`Asana API error: ${errMsg}`);
+  }
+  return data;
+}
+
+async function resolveAsanaProjectGid() {
+  if (ASANA_PROJECT_GID_CACHE) return ASANA_PROJECT_GID_CACHE;
+  if (!ASANA_WORKSPACE_GID) {
+    throw new Error("ASANA_PROJECT_GID is not set and ASANA_WORKSPACE_GID is unavailable.");
+  }
+
+  const data = await asanaRequest("GET", `/workspaces/${ASANA_WORKSPACE_GID}/projects`, {
+    query: {
+      limit: 100,
+      archived: "false",
+      opt_fields: "gid,name",
+    },
+  });
+
+  const projects = Array.isArray(data?.data) ? data.data : [];
+  const match = projects.find((p) => String(p?.name || "").trim().toLowerCase() === ASANA_PROJECT_NAME.toLowerCase());
+  if (!match?.gid) {
+    throw new Error(`Project '${ASANA_PROJECT_NAME}' not found in workspace ${ASANA_WORKSPACE_GID}.`);
+  }
+  ASANA_PROJECT_GID_CACHE = String(match.gid);
+  return ASANA_PROJECT_GID_CACHE;
+}
+
+async function listAsanaTasks(status = "current", limit = ASANA_TASK_LIST_LIMIT) {
+  const projectGid = await resolveAsanaProjectGid();
+  const maxItems = Math.max(1, Math.min(100, parseInt(String(limit || ASANA_TASK_LIST_LIMIT), 10) || ASANA_TASK_LIST_LIMIT));
+  const includeCompleted = status === "done" || status === "all";
+
+  const tasks = [];
+  let offset = "";
+  let page = 0;
+  while (tasks.length < maxItems && page < 6) {
+    page += 1;
+    const query = {
+      project: projectGid,
+      limit: 50,
+      offset,
+      completed_since: includeCompleted ? "1970-01-01T00:00:00.000Z" : "now",
+      opt_fields: "gid,name,completed,completed_at,due_on,due_at,created_at,permalink_url,assignee.name,memberships.section.name",
+    };
+    const data = await asanaRequest("GET", "/tasks", { query });
+    const chunk = Array.isArray(data?.data) ? data.data : [];
+    tasks.push(...chunk);
+    const nextOffset = data?.next_page?.offset;
+    if (!nextOffset) break;
+    offset = nextOffset;
+  }
+
+  let filtered = tasks;
+  if (status === "current") {
+    filtered = tasks.filter((t) => !t?.completed);
+  } else if (status === "done") {
+    filtered = tasks.filter((t) => !!t?.completed);
+  }
+
+  if (status === "done") {
+    filtered.sort((a, b) => Date.parse(b?.completed_at || 0) - Date.parse(a?.completed_at || 0));
+  } else {
+    filtered.sort((a, b) => {
+      const ad = Date.parse(a?.due_on || a?.due_at || "9999-12-31");
+      const bd = Date.parse(b?.due_on || b?.due_at || "9999-12-31");
+      if (ad !== bd) return ad - bd;
+      return Date.parse(a?.created_at || 0) - Date.parse(b?.created_at || 0);
+    });
+  }
+  return filtered.slice(0, maxItems);
+}
+
+function formatAsanaTaskLine(task, idx) {
+  const title = task?.name || "(untitled)";
+  const gid = task?.gid || "n/a";
+  const due = task?.due_on || (task?.due_at ? String(task.due_at).slice(0, 10) : "");
+  const assignee = task?.assignee?.name || "";
+  const section = task?.memberships?.[0]?.section?.name || "";
+  const suffix = [
+    due ? `due ${due}` : "",
+    assignee ? `@${assignee}` : "",
+    section ? `#${section}` : "",
+  ].filter(Boolean).join(" · ");
+  return `${idx + 1}. ${title}${suffix ? ` — ${suffix}` : ""} (id: ${gid})`;
+}
+
+function formatAsanaTaskList(tasks, heading) {
+  if (!tasks.length) return `${heading}\nNo tasks found.`;
+  const lines = tasks.map((t, i) => formatAsanaTaskLine(t, i));
+  return `${heading}\n${lines.join("\n")}`;
+}
+
+async function createAsanaTask(rawText) {
+  const projectGid = await resolveAsanaProjectGid();
+  const text = String(rawText || "").trim();
+  if (!text) throw new Error("Task title is empty.");
+
+  const dueMatch = text.match(/\s+due:(\d{4}-\d{2}-\d{2})\s*$/i);
+  const dueOn = dueMatch ? dueMatch[1] : "";
+  const title = dueMatch ? text.replace(/\s+due:\d{4}-\d{2}-\d{2}\s*$/i, "").trim() : text;
+  if (!title) throw new Error("Task title is empty.");
+
+  const payload = {
+    data: {
+      name: title,
+      projects: [projectGid],
+      ...(dueOn ? { due_on: dueOn } : {}),
+    },
+  };
+  const res = await asanaRequest("POST", "/tasks", { body: payload });
+  return res?.data || null;
+}
+
+async function markAsanaTaskDone(taskGid) {
+  const gid = String(taskGid || "").trim();
+  if (!gid) throw new Error("Task id is empty.");
+  const res = await asanaRequest("PUT", `/tasks/${gid}`, {
+    body: { data: { completed: true } },
+  });
+  return res?.data || null;
 }
 
 function normalizeQuestionText(raw) {
@@ -1292,6 +1482,47 @@ async function refreshMemoryBankFromRecentMeetings(limit = 20) {
   return `Memory bank refreshed with ${snapshots.length} meetings. Files: ${MEMORY_BANK_JSON}, ${MEMORY_BANK_MD}`;
 }
 
+function parseTasksMode(rawText = "") {
+  const t = String(rawText || "").toLowerCase();
+  if (/\bdone|completed|closed|finished\b/.test(t)) return "done";
+  if (/\ball\b/.test(t)) return "all";
+  return "current";
+}
+
+async function handleAsanaTasksCommand(ctx, rawText = "") {
+  const mode = parseTasksMode(rawText);
+  const headingByMode = {
+    current: `📋 Asana: current tasks (${ASANA_PROJECT_NAME})`,
+    done: `✅ Asana: done tasks (${ASANA_PROJECT_NAME})`,
+    all: `🗂 Asana: all tasks (${ASANA_PROJECT_NAME})`,
+  };
+  const tasks = await listAsanaTasks(mode, ASANA_TASK_LIST_LIMIT);
+  await ctx.reply(trimOut(formatAsanaTaskList(tasks, headingByMode[mode] || headingByMode.current)));
+}
+
+async function handleAsanaTaskAddCommand(ctx, rawText = "") {
+  const payload = String(rawText || "").trim();
+  if (!payload) {
+    await ctx.reply("Usage: /task_add <title> [due:YYYY-MM-DD]");
+    return;
+  }
+  const created = await createAsanaTask(payload);
+  const title = created?.name || "(untitled)";
+  const gid = created?.gid || "n/a";
+  const due = created?.due_on ? `, due ${created.due_on}` : "";
+  await ctx.reply(trimOut(`✅ Task created: ${title}${due} (id: ${gid})`));
+}
+
+async function handleAsanaTaskDoneCommand(ctx, rawText = "") {
+  const gid = String(rawText || "").trim();
+  if (!gid) {
+    await ctx.reply("Usage: /task_done <task_id>");
+    return;
+  }
+  const updated = await markAsanaTaskDone(gid);
+  await ctx.reply(trimOut(`✅ Task marked done: ${updated?.name || gid} (id: ${updated?.gid || gid})`));
+}
+
 async function runDryRun() {
   console.log("DRY_RUN=1: validating MCP connectivity...");
   const tools = await withMcpClient(async (client) => client.listTools());
@@ -1363,6 +1594,9 @@ async function main() {
         "/status — show Fellow sync status\n" +
         "/sync — sync meetings/transcripts cache\n" +
         "/memory [N] — refresh local memory bank from last N meetings\n" +
+        "/tasks [current|done|all] — list Asana tasks from General Tasks\n" +
+        "/task_add <title> [due:YYYY-MM-DD] — create Asana task\n" +
+        "/task_done <task_id> — mark Asana task as completed\n" +
         "/transcript <title> — get meeting transcript\n" +
         "/ask <question> — ask in groups (works even with privacy mode)\n" +
         "Tip: ask 'weekly trends' for a 7-day summary.\n" +
@@ -1425,6 +1659,39 @@ async function main() {
     }
   });
 
+  bot.command("tasks", async (ctx) => {
+    ctx.state.handledCommand = true;
+    if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
+    const txt = (ctx.message?.text || "").trim();
+    try {
+      await handleAsanaTasksCommand(ctx, txt.replace(/^\/tasks(?:@\w+)?\s*/i, ""));
+    } catch (e) {
+      await ctx.reply(`Asana tasks error: ${e?.message || String(e)}`);
+    }
+  });
+
+  bot.command("task_add", async (ctx) => {
+    ctx.state.handledCommand = true;
+    if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
+    const txt = (ctx.message?.text || "").trim();
+    try {
+      await handleAsanaTaskAddCommand(ctx, txt.replace(/^\/task_add(?:@\w+)?\s*/i, ""));
+    } catch (e) {
+      await ctx.reply(`Asana create error: ${e?.message || String(e)}`);
+    }
+  });
+
+  bot.command("task_done", async (ctx) => {
+    ctx.state.handledCommand = true;
+    if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
+    const txt = (ctx.message?.text || "").trim();
+    try {
+      await handleAsanaTaskDoneCommand(ctx, txt.replace(/^\/task_done(?:@\w+)?\s*/i, ""));
+    } catch (e) {
+      await ctx.reply(`Asana complete error: ${e?.message || String(e)}`);
+    }
+  });
+
   bot.command("ask", async (ctx) => {
     ctx.state.handledCommand = true;
     if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
@@ -1480,6 +1747,9 @@ async function main() {
             "/status — show Fellow sync status\n" +
             "/sync — sync meetings/transcripts cache\n" +
             "/memory [N] — refresh local memory bank from last N meetings\n" +
+            "/tasks [current|done|all] — list Asana tasks from General Tasks\n" +
+            "/task_add <title> [due:YYYY-MM-DD] — create Asana task\n" +
+            "/task_done <task_id> — mark Asana task as completed\n" +
             "/transcript <title> — get meeting transcript\n" +
             "/ask <question> — ask in groups (works even with privacy mode)\n" +
             "Tip: ask 'weekly trends' for a 7-day summary.\n" +
@@ -1534,6 +1804,33 @@ async function main() {
           await ctx.reply(trimOut(info));
         } catch (e) {
           await ctx.reply(`Memory refresh error: ${e?.message || String(e)}`);
+        }
+        return;
+      }
+
+      if (/^\/tasks(?:@\w+)?(?:\s|$)/i.test(lower)) {
+        try {
+          await handleAsanaTasksCommand(ctx, txt.replace(/^\/tasks(?:@\w+)?\s*/i, ""));
+        } catch (e) {
+          await ctx.reply(`Asana tasks error: ${e?.message || String(e)}`);
+        }
+        return;
+      }
+
+      if (/^\/task_add(?:@\w+)?(?:\s|$)/i.test(lower)) {
+        try {
+          await handleAsanaTaskAddCommand(ctx, txt.replace(/^\/task_add(?:@\w+)?\s*/i, ""));
+        } catch (e) {
+          await ctx.reply(`Asana create error: ${e?.message || String(e)}`);
+        }
+        return;
+      }
+
+      if (/^\/task_done(?:@\w+)?(?:\s|$)/i.test(lower)) {
+        try {
+          await handleAsanaTaskDoneCommand(ctx, txt.replace(/^\/task_done(?:@\w+)?\s*/i, ""));
+        } catch (e) {
+          await ctx.reply(`Asana complete error: ${e?.message || String(e)}`);
         }
         return;
       }
