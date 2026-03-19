@@ -756,6 +756,29 @@ function stripLikelyOwnerPrefix(title) {
   return m ? m[2].trim() : t;
 }
 
+function finalizeAsanaTitle(text) {
+  const trailingJoiners = new Set([
+    "with", "to", "for", "and", "or", "of", "in", "on", "at", "by", "from", "about", "into", "onto", "via",
+  ]);
+  let t = String(text || "")
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  t = t.replace(/[,:;.\-]+$/g, "").trim();
+  if (!t) return "Action item";
+
+  let words = t.split(/\s+/).filter(Boolean);
+  if (words.length > 9) words = words.slice(0, 9);
+  while (words.length > 3 && trailingJoiners.has(words[words.length - 1].toLowerCase())) {
+    words.pop();
+  }
+  t = words.join(" ").trim();
+  if (t.length > 72) {
+    t = t.slice(0, 72).replace(/\s+\S*$/, "").trim();
+  }
+  return t || "Action item";
+}
+
 function titleStem(text, words = 6) {
   const norm = normalizeTaskTitle(stripLikelyOwnerPrefix(text));
   if (!norm) return "";
@@ -764,10 +787,6 @@ function titleStem(text, words = 6) {
 }
 
 function buildShortAsanaTaskTitle(item) {
-  const owner = String(item?.owner || "").trim();
-  const trailingJoiners = new Set([
-    "with", "to", "for", "and", "or", "of", "in", "on", "at", "by", "from", "about", "into", "onto", "via",
-  ]);
   let core = String(item?.title || "")
     .replace(/\(assigned to:[^)]+\)/ig, "")
     .replace(/\([^)]*\)/g, " ")
@@ -782,20 +801,76 @@ function buildShortAsanaTaskTitle(item) {
     .replace(/\s+for\s+future\s+reference.*$/i, "")
     .trim();
 
-  const words = core.split(/\s+/).filter(Boolean);
-  const compactWords = words.slice(0, 10);
-  while (
-    compactWords.length > 3 &&
-    trailingJoiners.has(compactWords[compactWords.length - 1].toLowerCase())
-  ) {
-    compactWords.pop();
+  return finalizeAsanaTitle(core);
+}
+
+async function summarizeAsanaTaskTitles(items) {
+  const src = Array.isArray(items) ? items : [];
+  if (!src.length) return [];
+  const fallback = src.map((item) => buildShortAsanaTaskTitle(item));
+  if (!ENABLE_LLM_SYNTHESIS || !GEMINI_API_KEY) return fallback;
+
+  const lines = src.map((item, idx) => {
+    const owner = item?.owner ? `Owner: ${item.owner}. ` : "";
+    return `${idx + 1}. ${owner}Action: ${item?.title || ""}`;
+  }).join("\n");
+
+  const prompt =
+    "Summarize each action item into a short Asana task title.\n" +
+    "Rules:\n" +
+    "- 4-8 words\n" +
+    "- meaningful summary, not truncation\n" +
+    "- no trailing prepositions\n" +
+    "- no quotes, no numbering\n" +
+    "- output JSON array only: [{\"i\":1,\"title\":\"...\"}, ...]\n\n" +
+    `Items:\n${lines}`;
+
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}` +
+    `:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+
+  try {
+    const res = await withTimeout(
+      fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.1,
+            maxOutputTokens: 500,
+            thinkingConfig: { thinkingBudget: 0 },
+          },
+        }),
+      }),
+      20000,
+      "Gemini Asana title summary",
+    );
+    if (!res.ok) return fallback;
+    const data = await res.json();
+    const text = (data?.candidates || [])
+      .flatMap((c) => c?.content?.parts || [])
+      .map((p) => p?.text || "")
+      .join("\n")
+      .trim();
+    const arr =
+      parseJsonArray(text) ||
+      parseJsonArray((text.match(/\[[\s\S]*\]/) || [])[0] || "");
+    if (!Array.isArray(arr) || !arr.length) return fallback;
+
+    const out = [...fallback];
+    for (const row of arr) {
+      const i = Number(row?.i ?? row?.idx ?? row?.index);
+      const rawTitle = row?.title ?? row?.name ?? "";
+      if (!Number.isInteger(i) || i < 1 || i > out.length) continue;
+      const clean = finalizeAsanaTitle(rawTitle);
+      if (!clean) continue;
+      out[i - 1] = clean;
+    }
+    return out;
+  } catch {
+    return fallback;
   }
-  let shortCore = compactWords.join(" ");
-  if (shortCore.length > 72) {
-    shortCore = shortCore.slice(0, 72).replace(/\s+\S*$/, "").trim();
-  }
-  const finalCore = shortCore || core || "Action item";
-  return owner ? `${owner}: ${finalCore}` : finalCore;
 }
 
 function extractActionItemsSection(text) {
@@ -947,13 +1022,15 @@ async function importActionItemsToAsanaFromContext({ question = "", chatId = "",
   const existingSet = new Set(existingOpenTasks.map((t) => normalizeTaskTitle(t?.name || "")));
   const existingCoreSet = new Set(existingOpenTasks.map((t) => normalizeTaskTitle(stripLikelyOwnerPrefix(t?.name || ""))));
   const existingStemSet = new Set(existingOpenTasks.map((t) => titleStem(t?.name || "", 6)));
+  const summarizedTitles = await summarizeAsanaTaskTitles(dedup);
 
   let created = 0;
   let skippedDuplicates = 0;
   const createdLines = [];
-  for (const item of dedup) {
-    const asanaTitle = buildShortAsanaTaskTitle(item);
-    const originalTitle = item.owner ? `${item.owner}: ${item.title}` : item.title;
+  for (let i = 0; i < dedup.length; i += 1) {
+    const item = dedup[i];
+    const asanaTitle = finalizeAsanaTitle(summarizedTitles[i] || buildShortAsanaTaskTitle(item));
+    const originalTitle = item.title;
     const normalizedTitle = normalizeTaskTitle(asanaTitle);
     const normalizedCore = normalizeTaskTitle(stripLikelyOwnerPrefix(asanaTitle));
     const normalizedOriginal = normalizeTaskTitle(originalTitle);
@@ -1397,6 +1474,27 @@ function parseJsonObject(text) {
     if (start >= 0 && end > start) {
       try {
         return JSON.parse(trimmed.slice(start, end + 1));
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+function parseJsonArray(text) {
+  if (!text) return null;
+  const trimmed = text.trim();
+  try {
+    const parsed = JSON.parse(trimmed);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    const start = trimmed.indexOf("[");
+    const end = trimmed.lastIndexOf("]");
+    if (start >= 0 && end > start) {
+      try {
+        const parsed = JSON.parse(trimmed.slice(start, end + 1));
+        return Array.isArray(parsed) ? parsed : null;
       } catch {
         return null;
       }
