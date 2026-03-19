@@ -496,10 +496,22 @@ async function createAsanaTask(rawText) {
   const title = dueMatch ? text.replace(/\s+due:\d{4}-\d{2}-\d{2}\s*$/i, "").trim() : text;
   if (!title) throw new Error("Task title is empty.");
 
+  return createAsanaTaskWithFields({
+    projectGid,
+    name: title,
+    dueOn,
+  });
+}
+
+async function createAsanaTaskWithFields({ projectGid = "", name = "", notes = "", dueOn = "" } = {}) {
+  const effectiveProject = projectGid || await resolveAsanaProjectGid();
+  const title = String(name || "").trim();
+  if (!title) throw new Error("Task title is empty.");
   const payload = {
     data: {
       name: title,
-      projects: [projectGid],
+      projects: [effectiveProject],
+      ...(notes ? { notes: String(notes).trim() } : {}),
       ...(dueOn ? { due_on: dueOn } : {}),
     },
   };
@@ -710,6 +722,205 @@ function normalizeQuestionText(raw) {
   q = q.replace(/^@\w+\s*/i, "");
   q = q.replace(/^[,:;\-\.\s]+/, "");
   return q.trim();
+}
+
+function looksLikeAsanaActionImportRequest(q) {
+  const t = (q || "").toLowerCase();
+  const asksAsana = t.includes("asana") || t.includes("general tasks");
+  const asksActions = t.includes("action item") || t.includes("action items") || t.includes("tasks from summary");
+  const asksCreate = t.includes("create") || t.includes("add") || t.includes("put") || t.includes("save") || t.includes("sync");
+  return asksAsana && (asksActions || asksCreate);
+}
+
+function mentionsPreviousResponseSource(q) {
+  const t = (q || "").toLowerCase();
+  return (
+    t.includes("previous response") ||
+    t.includes("previous summary") ||
+    t.includes("from summary") ||
+    t.includes("from previous")
+  );
+}
+
+function normalizeTaskTitle(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[^\p{L}\p{N}\s:.,/#&()-]/gu, "")
+    .trim();
+}
+
+function stripLikelyOwnerPrefix(title) {
+  const t = String(title || "").trim();
+  const m = t.match(/^([A-Za-z][A-Za-z .'-]{1,40}):\s*(.+)$/);
+  return m ? m[2].trim() : t;
+}
+
+function extractActionItemsSection(text) {
+  const src = String(text || "");
+  if (!src.trim()) return "";
+  const mdBold = src.match(/\*\*Action items\*\*([\s\S]*?)(?:\n\*\*[^*\n]+\*\*|$)/i);
+  if (mdBold?.[1]) return mdBold[1];
+  const mdHeader = src.match(/(?:^|\n)#+\s*Action Items?\s*([\s\S]*?)(?:\n#+\s*\w|$)/i);
+  if (mdHeader?.[1]) return mdHeader[1];
+  return src;
+}
+
+function parseActionItemsFromText(text, source = "") {
+  const section = extractActionItemsSection(text);
+  const lines = String(section || "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .filter((l) => !/^[-*]?\s*action items?:?\s*$/i.test(l))
+    .filter((l) => !/^[-*]?\s*open issues/i.test(l))
+    .filter((l) => !/^[-*]?\s*blockers?/i.test(l));
+
+  const items = [];
+  const pushItem = (title, owner = "") => {
+    const cleanTitle = String(title || "").replace(/^[-*]\s*/, "").trim();
+    const cleanOwner = String(owner || "").trim();
+    if (!cleanTitle || cleanTitle.length < 6) return;
+    const normalized = normalizeTaskTitle(cleanTitle);
+    if (!normalized) return;
+    items.push({
+      title: cleanTitle,
+      owner: cleanOwner,
+      source,
+      normalized,
+    });
+  };
+
+  for (const raw of lines) {
+    const line = raw
+      .replace(/^\[[^\]]+\]\s*(assistant|user):\s*/i, "")
+      .replace(/^\d+\.\s*/, "")
+      .trim();
+    if (!line) continue;
+
+    let m = line.match(/action item:\s*(.+?)(?:\s*\(assigned to:\s*([^)]+)\))?\s*$/i);
+    if (m) {
+      pushItem(m[1], m[2] || "");
+      continue;
+    }
+
+    m = line.match(/^\[\s*\]\s*(.+)$/);
+    if (m) {
+      pushItem(m[1], "");
+      continue;
+    }
+
+    m = line.match(/^\*\*([^*]{2,60})\*\*\s*:\s*(.+)$/);
+    if (m) {
+      pushItem(m[2], m[1]);
+      continue;
+    }
+
+    m = line.match(/^([A-Za-z][A-Za-z .'-]{1,40})\s*:\s*(.+)$/);
+    if (m && !/^(scope|summary|decisions|next steps|executive takeaway)$/i.test(m[1])) {
+      pushItem(m[2], m[1]);
+      continue;
+    }
+
+    if (/^\*|^-/.test(raw)) {
+      pushItem(line.replace(/^[-*]\s*/, ""), "");
+    }
+  }
+
+  const uniq = [];
+  const seen = new Set();
+  for (const it of items) {
+    if (seen.has(it.normalized)) continue;
+    seen.add(it.normalized);
+    uniq.push(it);
+  }
+  return uniq;
+}
+
+async function getRecentAssistantTexts(chatId, limit = 8) {
+  if (!chatId || !ENABLE_CHAT_HISTORY) return [];
+  await ensureChatHistoryLoaded();
+  const entries = CHAT_HISTORY_BY_CHAT.get(String(chatId)) || [];
+  return entries
+    .filter((e) => e?.role === "assistant" && e?.text)
+    .slice(-Math.max(1, limit))
+    .map((e) => String(e.text));
+}
+
+async function importActionItemsToAsanaFromContext({ question = "", chatId = "", selectedMeetings = [] } = {}) {
+  if (!isAsanaConfigured()) {
+    throw new Error(asanaConfigHint() || "Asana is not configured.");
+  }
+
+  const candidates = [];
+  const meetings = Array.isArray(selectedMeetings) ? selectedMeetings.slice(0, 3) : [];
+  for (const m of meetings) {
+    const title = m?.title || "(untitled)";
+    const when = m?.event_start_local || m?.event_start || "N/A";
+    const sourceTag = `${title} — ${when}`;
+
+    const actionsText = await tryGetActionItems(m);
+    const parsedFromActions = parseActionItemsFromText(actionsText, sourceTag);
+    for (const item of parsedFromActions) candidates.push(item);
+
+    if (!parsedFromActions.length) {
+      const summaryText = await tryGetMeetingSummary(m);
+      const parsedFromSummary = parseActionItemsFromText(summaryText, sourceTag);
+      for (const item of parsedFromSummary) candidates.push(item);
+    }
+  }
+
+  if (mentionsPreviousResponseSource(question) || !candidates.length) {
+    const recentAssistant = await getRecentAssistantTexts(chatId, 12);
+    for (const msg of recentAssistant) {
+      const parsed = parseActionItemsFromText(msg, "previous bot response");
+      for (const item of parsed) candidates.push(item);
+    }
+  }
+
+  const dedup = [];
+  const seen = new Set();
+  for (const c of candidates) {
+    if (!c?.normalized || seen.has(c.normalized)) continue;
+    seen.add(c.normalized);
+    dedup.push(c);
+  }
+  if (!dedup.length) {
+    return "I couldn't extract actionable items to create in Asana from the selected meeting notes/previous response.";
+  }
+
+  const existingOpenTasks = await listAsanaTasks("current", 120);
+  const existingSet = new Set(existingOpenTasks.map((t) => normalizeTaskTitle(t?.name || "")));
+  const existingCoreSet = new Set(existingOpenTasks.map((t) => normalizeTaskTitle(stripLikelyOwnerPrefix(t?.name || ""))));
+
+  let created = 0;
+  let skippedDuplicates = 0;
+  const createdLines = [];
+  for (const item of dedup) {
+    const asanaTitle = item.owner ? `${item.owner}: ${item.title}` : item.title;
+    const normalizedTitle = normalizeTaskTitle(asanaTitle);
+    const normalizedCore = normalizeTaskTitle(stripLikelyOwnerPrefix(asanaTitle));
+    if (existingSet.has(normalizedTitle) || existingCoreSet.has(normalizedCore)) {
+      skippedDuplicates += 1;
+      continue;
+    }
+    const notes = [
+      `Source: ${item.source || "meeting context"}`,
+      `Created by Telegram bot from /ask request.`,
+      `Original action item: ${item.title}`,
+    ].join("\n");
+
+    const task = await createAsanaTaskWithFields({ name: asanaTitle, notes });
+    created += 1;
+    existingSet.add(normalizedTitle);
+    existingCoreSet.add(normalizedCore);
+    createdLines.push(`- ${task?.name || asanaTitle} (id: ${task?.gid || "n/a"})`);
+  }
+
+  const header = `✅ Asana sync complete for action items (${ASANA_PROJECT_NAME}).`;
+  const stats = `Created: ${created}, skipped as duplicates: ${skippedDuplicates}, extracted: ${dedup.length}.`;
+  const body = createdLines.length ? `\n\nCreated tasks:\n${createdLines.join("\n")}` : "";
+  return `${header}\n${stats}${body}`;
 }
 
 function detectNoResults(text) {
@@ -1664,6 +1875,20 @@ async function answerQuestion(question, chatId = "") {
     selectedMeetings = sortMeetingsByDateDesc(base).slice(0, 5);
   } else {
     selectedMeetings = (rankedMeetings.length ? rankedMeetings : allMeetings).slice(0, 3);
+  }
+
+  if (looksLikeAsanaActionImportRequest(safeQuestion)) {
+    try {
+      return trimOut(
+        await importActionItemsToAsanaFromContext({
+          question: safeQuestion,
+          chatId,
+          selectedMeetings,
+        }),
+      );
+    } catch (e) {
+      return `I couldn't sync action items to Asana: ${e?.message || String(e)}`;
+    }
   }
 
   const cachedPrimary = await callTool("search_cached_notes", { query: safeQuestion });
