@@ -802,9 +802,14 @@ function parseActionItemsFromText(text, source = "") {
       .trim();
     if (!line) continue;
 
-    let m = line.match(/^(?:[-*]\s*)?(?:\*+\s*)?action item:\s*(.+?)(?:\s*\(assigned to:\s*([^)]+)\))?\s*$/i);
+    let ownerFromParen = "";
+    const ownMatch = line.match(/\(assigned to:\s*([^)]+)\)/i);
+    if (ownMatch?.[1]) ownerFromParen = ownMatch[1].trim();
+    const strippedAssigned = line.replace(/\(assigned to:[^)]+\)/ig, "").trim();
+
+    let m = strippedAssigned.match(/^(?:[-*]\s*)?(?:\*+\s*)?action item:\s*(.+?)\s*$/i);
     if (m) {
-      pushItem(m[1], m[2] || "");
+      pushItem(m[1], ownerFromParen);
       continue;
     }
 
@@ -827,11 +832,10 @@ function parseActionItemsFromText(text, source = "") {
     }
 
     if (/^\*|^-/.test(raw)) {
-      const candidate = line
+      const candidate = strippedAssigned
         .replace(/^[-*]\s*/, "")
-        .replace(/\s*\(assigned to:[^)]+\)\s*$/i, "")
         .trim();
-      pushItem(candidate, "");
+      pushItem(candidate, ownerFromParen);
     }
   }
 
