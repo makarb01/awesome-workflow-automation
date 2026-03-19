@@ -765,20 +765,35 @@ function titleStem(text, words = 6) {
 
 function buildShortAsanaTaskTitle(item) {
   const owner = String(item?.owner || "").trim();
+  const trailingJoiners = new Set([
+    "with", "to", "for", "and", "or", "of", "in", "on", "at", "by", "from", "about", "into", "onto", "via",
+  ]);
   let core = String(item?.title || "")
     .replace(/\(assigned to:[^)]+\)/ig, "")
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/[–—]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 
   core = core
     .replace(/^(to\s+)?(purchase|create|document|notify|contact|send|get|ask|prepare|add|share|verify)\s+/i, (m) => m.trim() + " ")
     .replace(/\s+(then|and then)\s+.*$/i, "")
+    .replace(/\s+(so that|so we can|so that we can)\s+.*$/i, "")
     .replace(/\s+for\s+future\s+reference.*$/i, "")
-    .replace(/\s*\(.*?\)\s*$/i, "")
     .trim();
 
   const words = core.split(/\s+/).filter(Boolean);
-  const shortCore = words.slice(0, 8).join(" ");
+  const compactWords = words.slice(0, 10);
+  while (
+    compactWords.length > 3 &&
+    trailingJoiners.has(compactWords[compactWords.length - 1].toLowerCase())
+  ) {
+    compactWords.pop();
+  }
+  let shortCore = compactWords.join(" ");
+  if (shortCore.length > 72) {
+    shortCore = shortCore.slice(0, 72).replace(/\s+\S*$/, "").trim();
+  }
   const finalCore = shortCore || core || "Action item";
   return owner ? `${owner}: ${finalCore}` : finalCore;
 }
