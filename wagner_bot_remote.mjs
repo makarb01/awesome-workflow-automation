@@ -774,7 +774,11 @@ function parseActionItemsFromText(text, source = "") {
     .filter(Boolean)
     .filter((l) => !/^[-*]?\s*action items?:?\s*$/i.test(l))
     .filter((l) => !/^[-*]?\s*open issues/i.test(l))
-    .filter((l) => !/^[-*]?\s*blockers?/i.test(l));
+    .filter((l) => !/^[-*]?\s*blockers?/i.test(l))
+    .filter((l) => !/^(note id|recording id|event start|fellow url|language)\s*:/i.test(l))
+    .filter((l) => !/^https?:\/\//i.test(l))
+    .filter((l) => !/^#+\s*/.test(l))
+    .filter((l) => !/^\[\d{2}:\d{2}\s*-\s*\d{2}:\d{2}\]/.test(l));
 
   const items = [];
   const pushItem = (title, owner = "") => {
@@ -798,7 +802,7 @@ function parseActionItemsFromText(text, source = "") {
       .trim();
     if (!line) continue;
 
-    let m = line.match(/action item:\s*(.+?)(?:\s*\(assigned to:\s*([^)]+)\))?\s*$/i);
+    let m = line.match(/^(?:[-*]\s*)?(?:\*+\s*)?action item:\s*(.+?)(?:\s*\(assigned to:\s*([^)]+)\))?\s*$/i);
     if (m) {
       pushItem(m[1], m[2] || "");
       continue;
@@ -823,7 +827,11 @@ function parseActionItemsFromText(text, source = "") {
     }
 
     if (/^\*|^-/.test(raw)) {
-      pushItem(line.replace(/^[-*]\s*/, ""), "");
+      const candidate = line
+        .replace(/^[-*]\s*/, "")
+        .replace(/\s*\(assigned to:[^)]+\)\s*$/i, "")
+        .trim();
+      pushItem(candidate, "");
     }
   }
 
@@ -1878,12 +1886,15 @@ async function answerQuestion(question, chatId = "") {
   }
 
   if (looksLikeAsanaActionImportRequest(safeQuestion)) {
+    const importMeetings = todayRequested
+      ? (allMeetings.filter((m) => isTodayMeeting(m)).slice(0, 3) || [])
+      : selectedMeetings;
     try {
       return trimOut(
         await importActionItemsToAsanaFromContext({
           question: safeQuestion,
           chatId,
-          selectedMeetings,
+          selectedMeetings: importMeetings,
         }),
       );
     } catch (e) {
