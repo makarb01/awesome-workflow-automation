@@ -34,12 +34,21 @@ const MEMORY_BANK_MD = path.join(MEMORY_BANK_DIR, "meetings.md");
 const MEMORY_BANK_MAX_ITEMS = parseInt(process.env.MEMORY_BANK_MAX_ITEMS || "120", 10);
 const MEMORY_BANK_CONTEXT_ITEMS = parseInt(process.env.MEMORY_BANK_CONTEXT_ITEMS || "8", 10);
 const ENABLE_FELLOW_NATIVE_AI = (process.env.ENABLE_FELLOW_NATIVE_AI || "1") === "1";
+const ENABLE_CHAT_HISTORY = (process.env.ENABLE_CHAT_HISTORY || "1") === "1";
+const CHAT_HISTORY_MAX_MESSAGES = parseInt(process.env.CHAT_HISTORY_MAX_MESSAGES || "300", 10);
+const CHAT_HISTORY_CONTEXT_CHARS = parseInt(process.env.CHAT_HISTORY_CONTEXT_CHARS || "5000", 10);
+const CHAT_HISTORY_MAX_TEXT = parseInt(process.env.CHAT_HISTORY_MAX_TEXT || "700", 10);
+const CHAT_HISTORY_FILE = process.env.CHAT_HISTORY_FILE || path.join(MEMORY_BANK_DIR, "chat-history.json");
+const CHAT_HISTORY_RELEVANT_LINES = parseInt(process.env.CHAT_HISTORY_RELEVANT_LINES || "40", 10);
 
 const MCP_TOOL_CACHE = {
   names: null,
   fetchedAt: 0,
 };
 const MCP_TOOL_CACHE_TTL_MS = 5 * 60 * 1000;
+
+let CHAT_HISTORY_LOADED = false;
+const CHAT_HISTORY_BY_CHAT = new Map();
 
 const ACCOUNT_PROFILE_HINT_TERMS = [
   "meta",
@@ -203,10 +212,12 @@ async function tryNativeFellowAi(question, options = {}) {
 
   const requestedCalls = Number.isInteger(options.requestedCalls) ? options.requestedCalls : null;
   const focusTerms = Array.isArray(options.focusTerms) ? options.focusTerms : [];
+  const chatHistoryContext = String(options.chatHistoryContext || "").trim();
 
   const scopeHint = [
     requestedCalls ? `Limit analysis to last ${requestedCalls} calls.` : "",
     focusTerms.length ? `Focus strictly on: ${focusTerms.join(", ")}.` : "",
+    chatHistoryContext ? `Use this recent chat history context when relevant:\n${chatHistoryContext}` : "",
   ].filter(Boolean).join(" ");
   const fullQuestion = scopeHint ? `${question}\n\nContext instructions: ${scopeHint}` : question;
 
@@ -300,6 +311,101 @@ function rememberChatTurn(chatId, question, answer) {
     a: clipText(answer, 1800),
     ts: Date.now(),
   });
+}
+
+async function ensureChatHistoryLoaded() {
+  if (!ENABLE_CHAT_HISTORY || CHAT_HISTORY_LOADED) return;
+  try {
+    const raw = await fs.readFile(CHAT_HISTORY_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      for (const [chatId, entries] of Object.entries(parsed)) {
+        if (!Array.isArray(entries)) continue;
+        CHAT_HISTORY_BY_CHAT.set(
+          String(chatId),
+          entries
+            .filter((e) => e && typeof e === "object")
+            .map((e) => ({
+              role: e.role === "assistant" ? "assistant" : "user",
+              text: clipText(String(e.text || ""), CHAT_HISTORY_MAX_TEXT),
+              ts: Number(e.ts) || Date.now(),
+            }))
+            .slice(-CHAT_HISTORY_MAX_MESSAGES),
+        );
+      }
+    }
+  } catch {
+    // no persisted history yet
+  }
+  CHAT_HISTORY_LOADED = true;
+}
+
+async function persistChatHistory() {
+  if (!ENABLE_CHAT_HISTORY) return;
+  await fs.mkdir(path.dirname(CHAT_HISTORY_FILE), { recursive: true });
+  const obj = {};
+  for (const [chatId, entries] of CHAT_HISTORY_BY_CHAT.entries()) {
+    obj[chatId] = (entries || []).slice(-CHAT_HISTORY_MAX_MESSAGES);
+  }
+  await fs.writeFile(CHAT_HISTORY_FILE, JSON.stringify(obj, null, 2), "utf8");
+}
+
+async function appendChatHistory(chatId, role, text) {
+  if (!ENABLE_CHAT_HISTORY || !chatId || !text) return;
+  await ensureChatHistoryLoaded();
+  const key = String(chatId);
+  const arr = CHAT_HISTORY_BY_CHAT.get(key) || [];
+  arr.push({
+    role: role === "assistant" ? "assistant" : "user",
+    text: clipText(String(text), CHAT_HISTORY_MAX_TEXT),
+    ts: Date.now(),
+  });
+  CHAT_HISTORY_BY_CHAT.set(key, arr.slice(-CHAT_HISTORY_MAX_MESSAGES));
+  try {
+    await persistChatHistory();
+  } catch (e) {
+    console.log(`chat history persist failed: ${e?.message || String(e)}`);
+  }
+}
+
+function formatHistoryLine(entry) {
+  const d = new Date(entry.ts || Date.now()).toISOString();
+  const role = entry.role === "assistant" ? "assistant" : "user";
+  return `[${d}] ${role}: ${entry.text || ""}`;
+}
+
+function buildChatHistoryContextFromEntries(entries, question) {
+  const all = Array.isArray(entries) ? entries : [];
+  if (!all.length) return "";
+  const focusTerms = buildFocusTerms(question);
+  const scored = all.map((e, idx) => ({
+    e,
+    idx,
+    score: lineMatchScore(String(e?.text || ""), focusTerms),
+  }));
+  const relevant = scored
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score || b.idx - a.idx)
+    .slice(0, CHAT_HISTORY_RELEVANT_LINES)
+    .sort((a, b) => a.idx - b.idx)
+    .map((x) => formatHistoryLine(x.e));
+
+  const latest = all.slice(-Math.min(20, all.length)).map((e) => formatHistoryLine(e));
+  const merged = [];
+  const seen = new Set();
+  for (const line of [...relevant, ...latest]) {
+    if (seen.has(line)) continue;
+    seen.add(line);
+    merged.push(line);
+  }
+  return clipText(merged.join("\n"), CHAT_HISTORY_CONTEXT_CHARS);
+}
+
+async function getChatHistoryContext(chatId, question) {
+  if (!ENABLE_CHAT_HISTORY || !chatId) return "";
+  await ensureChatHistoryLoaded();
+  const entries = CHAT_HISTORY_BY_CHAT.get(String(chatId)) || [];
+  return buildChatHistoryContextFromEntries(entries, question);
 }
 
 function parseMeetingTime(meeting) {
@@ -836,6 +942,7 @@ async function synthesizeAnswerWithGemini(
   question,
   contextBlocks,
   chatMemoryContext = "",
+  chatHistoryContext = "",
   options = {},
 ) {
   if (!ENABLE_LLM_SYNTHESIS || !GEMINI_API_KEY) return "";
@@ -866,6 +973,7 @@ async function synthesizeAnswerWithGemini(
     "Prefer concrete issues over generic themes.\n\n" +
     `User question:\n${question}\n\n` +
     (chatMemoryContext ? `Recent chat memory:\n${chatMemoryContext}\n\n` : "") +
+    (chatHistoryContext ? `Recent chat history (last messages):\n${chatHistoryContext}\n\n` : "") +
     `Context:\n${context}`;
 
   const url =
@@ -962,9 +1070,14 @@ async function answerQuestion(question, chatId = "") {
   const transcriptRequested = looksLikeTranscriptRequest(safeQuestion);
   const wantsQuotedEvidence = /\b(quote|quoted|verbatim|exact|where was|who said)\b/i.test(safeQuestion);
   const meetingFetchLimit = Math.max(30, (requestedCalls || 5) + 16);
+  const chatHistoryContext = await getChatHistoryContext(chatId, safeQuestion);
 
   try {
-    const nativeAnswer = await tryNativeFellowAi(safeQuestion, { requestedCalls, focusTerms });
+    const nativeAnswer = await tryNativeFellowAi(safeQuestion, {
+      requestedCalls,
+      focusTerms,
+      chatHistoryContext,
+    });
     if (nativeAnswer) return trimOut(nativeAnswer);
   } catch (e) {
     console.log(`Native Fellow AI path failed: ${e?.message || String(e)}`);
@@ -1033,6 +1146,9 @@ async function answerQuestion(question, chatId = "") {
   if (!detectNoResults(cachedText) && cachedText) {
     contextBlocks.push(`Related cached notes:\n${clipText(cachedText, 3500)}`);
   }
+  if (chatHistoryContext) {
+    contextBlocks.push(`Recent chat history context:\n${clipText(chatHistoryContext, 2200)}`);
+  }
 
   try {
     const bankCtx = await buildMemoryBankContext(
@@ -1085,6 +1201,7 @@ async function answerQuestion(question, chatId = "") {
         safeQuestion,
         contextBlocks,
         memoryContext,
+        chatHistoryContext,
         { focusTerms, requestedCalls },
       );
       if (synthesized) return trimOut(synthesized);
@@ -1139,15 +1256,18 @@ async function handleIncomingText(ctx, text) {
     const chatId = String(ctx.chat?.id || "");
     const result = await withTimeout(answerQuestion(q, chatId), 85000, "answer generation");
     rememberChatTurn(chatId, q, result);
-    await ctx.reply(trimOut(result), { disable_web_page_preview: true });
+    const out = trimOut(result);
+    await ctx.reply(out, { disable_web_page_preview: true });
+    await appendChatHistory(chatId, "assistant", out);
   } catch (err) {
     const msg = err?.message || String(err);
-    await ctx.reply(
-      trimOut(
-        `Error while querying Fellow MCP: ${msg}\n\n` +
-          "Check FELLOW_API_KEY and FELLOW_SUBDOMAIN (stdio mode), or auth for FELLOW_MCP_URL (http mode).",
-      ),
+    const out = trimOut(
+      `Error while querying Fellow MCP: ${msg}\n\n` +
+        "Check FELLOW_API_KEY and FELLOW_SUBDOMAIN (stdio mode), or auth for FELLOW_MCP_URL (http mode).",
     );
+    await ctx.reply(out);
+    const chatId = String(ctx.chat?.id || "");
+    await appendChatHistory(chatId, "assistant", out);
   }
 }
 
@@ -1219,6 +1339,10 @@ async function main() {
         console.log(
           `update chat_id=${chat.id} type=${chat.type} thread=${thread} entities=${entities} text=${textPreview}`,
         );
+        const rawText = (msg.text || msg.caption || "").trim();
+        if (rawText && msg.from?.is_bot !== true && isAllowedChat(ctx)) {
+          await appendChatHistory(String(chat.id || ""), "user", rawText);
+        }
       } else {
         const keys = Object.keys(ctx.update || {}).join(",");
         console.log(`update non-message keys=${keys}`);
