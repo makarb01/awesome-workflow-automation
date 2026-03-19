@@ -3,6 +3,8 @@ import { Telegraf } from "telegraf";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { promises as fs } from "fs";
+import path from "path";
 
 dotenv.config();
 
@@ -25,6 +27,34 @@ const ENABLE_LLM_SYNTHESIS = (process.env.ENABLE_LLM_SYNTHESIS || "1") === "1";
 const MAX_CONTEXT_CHARS = parseInt(process.env.MAX_CONTEXT_CHARS || "14000", 10);
 const CHAT_MEMORY_TTL_MS = parseInt(process.env.CHAT_MEMORY_TTL_MS || "21600000", 10);
 const CHAT_MEMORY = new Map();
+const ENABLE_MEMORY_BANK = (process.env.ENABLE_MEMORY_BANK || "1") === "1";
+const MEMORY_BANK_DIR = process.env.MEMORY_BANK_DIR || "/root/fellow-telegram-bot/memory-bank";
+const MEMORY_BANK_JSON = path.join(MEMORY_BANK_DIR, "meetings.json");
+const MEMORY_BANK_MD = path.join(MEMORY_BANK_DIR, "meetings.md");
+const MEMORY_BANK_MAX_ITEMS = parseInt(process.env.MEMORY_BANK_MAX_ITEMS || "120", 10);
+const MEMORY_BANK_CONTEXT_ITEMS = parseInt(process.env.MEMORY_BANK_CONTEXT_ITEMS || "8", 10);
+
+const ACCOUNT_PROFILE_HINT_TERMS = [
+  "meta",
+  "facebook",
+  "ad account",
+  "ad accounts",
+  "account",
+  "accounts",
+  "profile",
+  "profiles",
+  "business manager",
+  "bm",
+  "pixel",
+  "page",
+  "pages",
+  "asset",
+  "assets",
+  "restricted",
+  "disabled",
+  "suspended",
+  "ban",
+];
 
 
 function withTimeout(promise, ms, label) {
@@ -197,6 +227,227 @@ function rememberChatTurn(chatId, question, answer) {
     a: clipText(answer, 1800),
     ts: Date.now(),
   });
+}
+
+function parseMeetingTime(meeting) {
+  const raw =
+    meeting?.event_start_local ||
+    meeting?.event_start ||
+    meeting?.when ||
+    meeting?.updated_at ||
+    "";
+  const t = Date.parse(raw);
+  return Number.isNaN(t) ? 0 : t;
+}
+
+function sortMeetingsByDateDesc(meetings) {
+  return [...(Array.isArray(meetings) ? meetings : [])].sort(
+    (a, b) => parseMeetingTime(b) - parseMeetingTime(a),
+  );
+}
+
+function parseRequestedCallCount(question) {
+  const q = String(question || "");
+  const patterns = [
+    /\blast\s+(\d{1,2})\s+(?:calls?|meetings?)\b/i,
+    /\bpast\s+(\d{1,2})\s+(?:calls?|meetings?)\b/i,
+    /\bпоследн(?:их|ие)\s+(\d{1,2})\s+(?:звонк\w*|встреч\w*)\b/i,
+  ];
+
+  for (const re of patterns) {
+    const m = q.match(re);
+    if (!m) continue;
+    const n = parseInt(m[1], 10);
+    if (Number.isNaN(n)) continue;
+    return Math.max(1, Math.min(20, n));
+  }
+  return null;
+}
+
+function asksForRecentCalls(question) {
+  const q = String(question || "").toLowerCase();
+  return (
+    /\b(last|latest|recent|past)\s+(calls?|meetings?)\b/.test(q) ||
+    /\b(последние|последних|недавние)\s+(звонк\w*|встреч\w*)\b/.test(q)
+  );
+}
+
+function splitIntoEvidenceLines(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => line.length >= 8)
+    .filter((line) => !/^#{1,6}\s+/.test(line))
+    .filter((line) => !/^(Note ID|Recording ID|Event Start|Fellow URL|Language):/i.test(line))
+    .filter((line) => !/^\[\d{2}:\d{2}\s*-\s*\d{2}:\d{2}\]/.test(line))
+    .filter((line) => !/^\((The things to talk about|What came out of this meeting)/i.test(line));
+}
+
+function buildFocusTerms(question) {
+  const q = String(question || "").toLowerCase();
+  const terms = new Set(tokenizeQueryTerms(q));
+  const accountRelated = ACCOUNT_PROFILE_HINT_TERMS.some((t) => q.includes(t));
+  if (accountRelated) {
+    for (const t of ACCOUNT_PROFILE_HINT_TERMS) terms.add(t);
+  }
+  if (q.includes("meta ad")) {
+    terms.add("meta");
+    terms.add("ad account");
+  }
+  return [...terms];
+}
+
+function lineMatchScore(line, focusTerms) {
+  const text = String(line || "").toLowerCase();
+  if (!text) return 0;
+  let score = 0;
+  for (const t of focusTerms || []) {
+    if (!t) continue;
+    if (text.includes(t)) score += t.includes(" ") ? 3 : 2;
+  }
+  if (/\b(issue|problem|blocked|cannot|can't|failed|error|rejected|restricted|disabled|suspended)\b/i.test(text)) {
+    score += 2;
+  }
+  if (/\b(account|profile|meta|business manager|bm|pixel|page)\b/i.test(text)) {
+    score += 2;
+  }
+  return score;
+}
+
+function pickFocusedLines(text, focusTerms, maxLines = 6) {
+  const lines = splitIntoEvidenceLines(text);
+  if (!lines.length) return [];
+  if (!focusTerms?.length) return lines.slice(0, maxLines);
+
+  const scored = lines.map((line, idx) => ({ line, idx, score: lineMatchScore(line, focusTerms) }));
+  const positive = scored.filter((x) => x.score > 0);
+  if (!positive.length) return [];
+
+  positive.sort((a, b) => b.score - a.score || a.idx - b.idx);
+  const uniq = [];
+  const seen = new Set();
+  for (const item of positive) {
+    const key = item.line.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniq.push(item.line);
+    if (uniq.length >= maxLines) break;
+  }
+  return uniq;
+}
+
+function pickTranscriptMatches(transcript, focusTerms, maxLines = 4) {
+  if (!transcript || !focusTerms?.length) return [];
+  const lines = String(transcript)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => line.length >= 8);
+
+  const out = [];
+  const seen = new Set();
+  for (const line of lines) {
+    const score = lineMatchScore(line, focusTerms);
+    if (score <= 0) continue;
+    const key = line.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(line);
+    if (out.length >= maxLines) break;
+  }
+  return out;
+}
+
+function meetingSnapshotToMd(item) {
+  const when = item.when || "N/A";
+  const issues = Array.isArray(item.issues) && item.issues.length
+    ? item.issues.map((x) => `- ${x}`).join("\n")
+    : "- (no focused issues captured yet)";
+  return (
+    `## ${item.title || "(untitled)"}\n` +
+    `- id: ${item.id || "n/a"}\n` +
+    `- when: ${when}\n` +
+    `- updated: ${item.updated_at || "n/a"}\n\n` +
+    `### Focused issues\n${issues}\n\n`
+  );
+}
+
+async function loadMemoryBank() {
+  if (!ENABLE_MEMORY_BANK) return [];
+  try {
+    const raw = await fs.readFile(MEMORY_BANK_JSON, "utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveMemoryBank(items) {
+  if (!ENABLE_MEMORY_BANK) return;
+  await fs.mkdir(MEMORY_BANK_DIR, { recursive: true });
+  const normalized = sortMeetingsByDateDesc(items).slice(0, MEMORY_BANK_MAX_ITEMS);
+  await fs.writeFile(MEMORY_BANK_JSON, JSON.stringify(normalized, null, 2), "utf8");
+
+  const md =
+    "# Fellow meeting memory bank\n\n" +
+    `Generated: ${new Date().toISOString()}\n\n` +
+    normalized.map((x) => meetingSnapshotToMd(x)).join("\n");
+  await fs.writeFile(MEMORY_BANK_MD, md, "utf8");
+}
+
+async function upsertMemoryBankItems(newItems) {
+  if (!ENABLE_MEMORY_BANK) return;
+  const incoming = (newItems || []).filter(Boolean);
+  if (!incoming.length) return;
+
+  const existing = await loadMemoryBank();
+  const byId = new Map();
+  for (const item of existing) {
+    if (item?.id) byId.set(String(item.id), item);
+  }
+  for (const item of incoming) {
+    if (!item?.id) continue;
+    byId.set(String(item.id), item);
+  }
+  await saveMemoryBank([...byId.values()]);
+}
+
+async function buildMemoryBankContext(question, focusTerms, desiredItems = MEMORY_BANK_CONTEXT_ITEMS) {
+  const items = await loadMemoryBank();
+  if (!items.length) return "";
+
+  const count = Math.max(1, Math.min(MEMORY_BANK_CONTEXT_ITEMS, desiredItems || MEMORY_BANK_CONTEXT_ITEMS));
+  const scored = items.map((item, idx) => {
+    const hay = [
+      item?.title || "",
+      ...(Array.isArray(item?.issues) ? item.issues : []),
+    ].join(" ").toLowerCase();
+    let score = 0;
+    for (const t of focusTerms || []) {
+      if (!t) continue;
+      if (hay.includes(t.toLowerCase())) score += t.includes(" ") ? 3 : 2;
+    }
+    if (!score && lineMatchScore(hay, focusTerms || [])) score += 1;
+    return { item, idx, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score || a.idx - b.idx);
+  const selected = scored
+    .filter((x) => x.score > 0)
+    .slice(0, count)
+    .map((x) => x.item);
+
+  const fallback = selected.length ? selected : sortMeetingsByDateDesc(items).slice(0, count);
+  if (!fallback.length) return "";
+
+  const lines = fallback.map((item, i) => {
+    const when = item.when || "N/A";
+    const issues = (item.issues || []).slice(0, 2).join(" | ");
+    return `${i + 1}. ${item.title || "(untitled)"} — ${when}${issues ? ` — ${issues}` : ""}`;
+  });
+  return `Memory bank matches:\n${lines.join("\n")}`;
 }
 
 
@@ -428,10 +679,13 @@ async function tryGetActionItems(meeting) {
   return "";
 }
 
-async function buildMeetingEvidence(meeting, includeTranscript = false) {
-  if (!meeting) return "";
+async function buildMeetingEvidence(meeting, options = {}) {
+  if (!meeting) return { text: "", snapshot: null, matchCount: 0 };
+  const includeTranscript = !!options.includeTranscript;
+  const focusTerms = Array.isArray(options.focusTerms) ? options.focusTerms : [];
   const title = meeting?.title || "(untitled)";
   const when = meeting?.event_start_local || meeting?.event_start || "N/A";
+  const stableId = String(meeting?.id || meeting?.note_id || `${title}|${when}`);
 
   const [summary, actions] = await Promise.all([
     tryGetMeetingSummary(meeting),
@@ -449,16 +703,59 @@ async function buildMeetingEvidence(meeting, includeTranscript = false) {
   }
 
   const summaryForLlm = summaryToHighlights(summary);
+  const summaryFocused = pickFocusedLines(summaryForLlm, focusTerms, 5);
+  const actionsFocused = pickFocusedLines(actions, focusTerms, 5);
+  const transcriptFocused = pickTranscriptMatches(transcript, focusTerms, 3);
+  const mergedIssues = [...summaryFocused, ...actionsFocused, ...transcriptFocused];
 
   const parts = [`Meeting: ${title} — ${when}`];
-  if (summaryForLlm) parts.push(`Summary:\n${clipText(summaryForLlm, 2200)}`);
-  if (actions) parts.push(`Action items:\n${clipText(actions, 1800)}`);
-  if (transcript) parts.push(`Transcript excerpt:\n${clipText(transcript, 2500)}`);
-  return parts.join("\n\n");
+  if (focusTerms.length) {
+    if (summaryFocused.length) {
+      parts.push(`Focused summary points:\n${summaryFocused.map((x) => `- ${x}`).join("\n")}`);
+    }
+    if (actionsFocused.length) {
+      parts.push(`Focused action-item points:\n${actionsFocused.map((x) => `- ${x}`).join("\n")}`);
+    }
+    if (transcriptFocused.length) {
+      parts.push(`Focused transcript points:\n${transcriptFocused.map((x) => `- ${x}`).join("\n")}`);
+    }
+    if (!summaryFocused.length && !actionsFocused.length && !transcriptFocused.length) {
+      parts.push("No explicit focus-term mentions found in this meeting evidence.");
+      if (summaryForLlm) {
+        const fallback = pickFocusedLines(summaryForLlm, [], 2);
+        if (fallback.length) {
+          parts.push(`Closest context:\n${fallback.map((x) => `- ${x}`).join("\n")}`);
+        }
+      }
+    }
+  } else {
+    if (summaryForLlm) parts.push(`Summary:\n${clipText(summaryForLlm, 2200)}`);
+    if (actions) parts.push(`Action items:\n${clipText(actions, 1800)}`);
+    if (transcript) parts.push(`Transcript excerpt:\n${clipText(transcript, 2500)}`);
+  }
+
+  return {
+    text: parts.join("\n\n"),
+    snapshot: {
+      id: stableId,
+      title,
+      when,
+      issues: mergedIssues.slice(0, 8),
+      updated_at: new Date().toISOString(),
+    },
+    matchCount: mergedIssues.length,
+  };
 }
 
-async function synthesizeAnswerWithGemini(question, contextBlocks, chatMemoryContext = "") {
+async function synthesizeAnswerWithGemini(
+  question,
+  contextBlocks,
+  chatMemoryContext = "",
+  options = {},
+) {
   if (!ENABLE_LLM_SYNTHESIS || !GEMINI_API_KEY) return "";
+  const focusTerms = Array.isArray(options.focusTerms) ? options.focusTerms : [];
+  const requestedCalls = Number.isInteger(options.requestedCalls) ? options.requestedCalls : null;
   const context = clipText(
     (contextBlocks || []).filter(Boolean).join("\n\n--------------------\n\n"),
     MAX_CONTEXT_CHARS,
@@ -472,9 +769,16 @@ async function synthesizeAnswerWithGemini(question, contextBlocks, chatMemoryCon
     "Paraphrase information; do NOT quote source text verbatim.\n" +
     "Do not output long copied passages from notes or transcripts.\n" +
     "If the user asks what changed, compare recent calls and list concrete changes.\n" +
+    (requestedCalls
+      ? `Treat scope as exactly the latest ${requestedCalls} calls if available.\n`
+      : "") +
+    (focusTerms.length
+      ? `Focus terms (strict): ${focusTerms.join(", ")}.\nIf evidence does not mention these terms, explicitly say so.\n`
+      : "") +
     "Always anchor statements with meeting title/date when possible.\n" +
     "If data is insufficient, explicitly say what is missing.\n" +
-    "Output format: 3-5 short bullets (each <= 22 words), then one short conclusion sentence.\n\n" +
+    "Output format: 3-5 short bullets (each <= 22 words), then one short conclusion sentence.\n" +
+    "Prefer concrete issues over generic themes.\n\n" +
     `User question:\n${question}\n\n` +
     (chatMemoryContext ? `Recent chat memory:\n${chatMemoryContext}\n\n` : "") +
     `Context:\n${context}`;
@@ -568,26 +872,28 @@ async function answerQuestion(question, chatId = "") {
     return "Empty query. Ask a question about Fellow meetings.";
   }
 
-  const meetingsRes = await callTool("search_meetings", { limit: 30 });
+  const requestedCalls = parseRequestedCallCount(safeQuestion) || (asksForRecentCalls(safeQuestion) ? 5 : null);
+  const focusTerms = buildFocusTerms(safeQuestion);
+  const transcriptRequested = looksLikeTranscriptRequest(safeQuestion);
+  const meetingFetchLimit = Math.max(30, (requestedCalls || 5) + 16);
+
+  const meetingsRes = await callTool("search_meetings", { limit: meetingFetchLimit });
   const meetingsText = extractTextFromToolResult(meetingsRes);
   const meetingsJson = parseJsonObject(meetingsText);
-  const allMeetings = Array.isArray(meetingsJson?.meetings) ? meetingsJson.meetings : [];
+  const allMeetings = sortMeetingsByDateDesc(
+    Array.isArray(meetingsJson?.meetings) ? meetingsJson.meetings : [],
+  );
   const rankedMeetings = rankMeetingsByQuery(allMeetings, safeQuestion);
 
-  if (looksLikeTranscriptRequest(safeQuestion)) {
-    const target = rankedMeetings[0] || allMeetings[0];
-    if (!target) {
-      return "No meetings found to pull transcript from. Run /sync and try again.";
-    }
-    try {
-      const tr = await callTool("get_meeting_transcript", { recording_id: target.id });
-      const trText = extractTextFromToolResult(tr);
-      return trimOut(
-        `📝 Transcript for: ${target.title || "latest meeting"}\n\n` + trText
-      );
-    } catch (e) {
-      return `Could not fetch transcript for the latest relevant meeting: ${e?.message || String(e)}`;
-    }
+  let selectedMeetings = [];
+  if (requestedCalls) {
+    const base = rankedMeetings.length ? sortMeetingsByDateDesc(rankedMeetings) : allMeetings;
+    selectedMeetings = base.slice(0, requestedCalls);
+  } else if (focusTerms.length) {
+    const base = rankedMeetings.length ? rankedMeetings : allMeetings;
+    selectedMeetings = sortMeetingsByDateDesc(base).slice(0, 6);
+  } else {
+    selectedMeetings = (rankedMeetings.length ? rankedMeetings : allMeetings).slice(0, 3);
   }
 
   const cachedPrimary = await callTool("search_cached_notes", { query: safeQuestion });
@@ -604,8 +910,21 @@ async function answerQuestion(question, chatId = "") {
     }
   }
 
-  const transcriptRequested = looksLikeTranscriptRequest(safeQuestion);
-  const selectedMeetings = (rankedMeetings.length ? rankedMeetings : allMeetings).slice(0, 3);
+  if (transcriptRequested) {
+    const target = selectedMeetings[0] || rankedMeetings[0] || allMeetings[0];
+    if (!target) {
+      return "No meetings found to pull transcript from. Run /sync and try again.";
+    }
+    try {
+      const tr = await callTool("get_meeting_transcript", { recording_id: target.id });
+      const trText = extractTextFromToolResult(tr);
+      return trimOut(
+        `📝 Transcript for: ${target.title || "latest meeting"}\n\n` + trText,
+      );
+    } catch (e) {
+      return `Could not fetch transcript for the latest relevant meeting: ${e?.message || String(e)}`;
+    }
+  }
 
   const contextBlocks = [];
   if (looksLikeWeeklyTrendsQuestion(safeQuestion)) {
@@ -613,15 +932,52 @@ async function answerQuestion(question, chatId = "") {
     contextBlocks.push(`Weekly trends snapshot:\n${weekly}`);
   }
   if (selectedMeetings.length) {
-    contextBlocks.push(`Relevant meetings:\n${formatMeetingsList(selectedMeetings, 6)}`);
+    const label = requestedCalls
+      ? `Latest ${requestedCalls} calls in scope`
+      : "Relevant meetings";
+    contextBlocks.push(`${label}:\n${formatMeetingsList(selectedMeetings, Math.max(3, selectedMeetings.length))}`);
   }
   if (!detectNoResults(cachedText) && cachedText) {
     contextBlocks.push(`Related cached notes:\n${clipText(cachedText, 3500)}`);
   }
 
+  try {
+    const bankCtx = await buildMemoryBankContext(
+      safeQuestion,
+      focusTerms,
+      requestedCalls || MEMORY_BANK_CONTEXT_ITEMS,
+    );
+    if (bankCtx) contextBlocks.push(bankCtx);
+  } catch (e) {
+    console.log(`Memory bank read failed: ${e?.message || String(e)}`);
+  }
+
+  const shouldPullTranscriptEvidence =
+    focusTerms.length > 0 &&
+    /(account|profile|meta|business manager|bm|ad account|pixel|page)/i.test(safeQuestion);
+
+  const freshSnapshots = [];
+  let focusedHits = 0;
   for (const m of selectedMeetings) {
-    const evidence = await buildMeetingEvidence(m, transcriptRequested);
-    if (evidence) contextBlocks.push(evidence);
+    const evidence = await buildMeetingEvidence(m, {
+      includeTranscript: shouldPullTranscriptEvidence,
+      focusTerms,
+    });
+    if (evidence?.text) contextBlocks.push(evidence.text);
+    if (evidence?.snapshot) freshSnapshots.push(evidence.snapshot);
+    focusedHits += evidence?.matchCount || 0;
+  }
+
+  try {
+    await upsertMemoryBankItems(freshSnapshots);
+  } catch (e) {
+    console.log(`Memory bank write failed: ${e?.message || String(e)}`);
+  }
+
+  if (focusTerms.length && selectedMeetings.length && focusedHits === 0) {
+    contextBlocks.push(
+      `Focus-note: No direct mentions found for focus terms (${focusTerms.join(", ")}) in selected meeting evidence.`,
+    );
   }
 
   const memoryContext = getChatMemoryContext(chatId);
@@ -631,26 +987,11 @@ async function answerQuestion(question, chatId = "") {
         safeQuestion,
         contextBlocks,
         memoryContext,
+        { focusTerms, requestedCalls },
       );
       if (synthesized) return trimOut(synthesized);
     } catch (e) {
       console.log(`Gemini synthesis failed: ${e?.message || String(e)}`);
-    }
-  }
-
-  if (transcriptRequested) {
-    const target = selectedMeetings[0];
-    if (!target) {
-      return "No meetings found to pull transcript from. Run /sync and try again.";
-    }
-    try {
-      const tr = await callTool("get_meeting_transcript", { recording_id: target.id });
-      const trText = extractTextFromToolResult(tr);
-      return trimOut(
-        `📝 Transcript for: ${target.title || "latest meeting"}\n\n` + trText
-      );
-    } catch (e) {
-      return `Could not fetch transcript for the latest relevant meeting: ${e?.message || String(e)}`;
     }
   }
 
@@ -666,6 +1007,13 @@ ${formatMeetingsList(rankedMeetings, 8)}`);
   } else if (allMeetings.length) {
     blocks.push(`🗓 Recent meetings:
 ${formatMeetingsList(allMeetings, 5)}`);
+  }
+
+  if (focusTerms.length) {
+    blocks.push(
+      `Focus terms used: ${focusTerms.slice(0, 12).join(", ") || "(none)"}.\n` +
+      "Tip: try `/ask list exact account/profile issues in last 5 calls with meeting/date`.",
+    );
   }
 
   if (!blocks.length) {
@@ -703,6 +1051,27 @@ async function handleIncomingText(ctx, text) {
       ),
     );
   }
+}
+
+async function refreshMemoryBankFromRecentMeetings(limit = 20) {
+  if (!ENABLE_MEMORY_BANK) {
+    return "Memory bank is disabled by config.";
+  }
+  const safeLimit = Math.max(5, Math.min(60, parseInt(String(limit || 20), 10) || 20));
+  const meetingsRes = await callTool("search_meetings", { limit: safeLimit });
+  const meetingsText = extractTextFromToolResult(meetingsRes);
+  const meetingsJson = parseJsonObject(meetingsText);
+  const meetings = sortMeetingsByDateDesc(
+    Array.isArray(meetingsJson?.meetings) ? meetingsJson.meetings : [],
+  ).slice(0, safeLimit);
+
+  const snapshots = [];
+  for (const m of meetings) {
+    const evidence = await buildMeetingEvidence(m, { includeTranscript: false, focusTerms: [] });
+    if (evidence?.snapshot) snapshots.push(evidence.snapshot);
+  }
+  await upsertMemoryBankItems(snapshots);
+  return `Memory bank refreshed with ${snapshots.length} meetings. Files: ${MEMORY_BANK_JSON}, ${MEMORY_BANK_MD}`;
 }
 
 async function runDryRun() {
@@ -770,6 +1139,7 @@ async function main() {
         "Commands:\n" +
         "/status — show Fellow sync status\n" +
         "/sync — sync meetings/transcripts cache\n" +
+        "/memory [N] — refresh local memory bank from last N meetings\n" +
         "/transcript <title> — get meeting transcript\n" +
         "/ask <question> — ask in groups (works even with privacy mode)\n" +
         "Tip: ask 'weekly trends' for a 7-day summary.\n" +
@@ -801,9 +1171,30 @@ async function main() {
         include_transcripts: true,
         page_size: 20,
       });
-      await ctx.reply(trimOut(extractTextFromToolResult(res)));
+      const syncText = trimOut(extractTextFromToolResult(res));
+      let memoryText = "";
+      try {
+        memoryText = await refreshMemoryBankFromRecentMeetings(24);
+      } catch (e) {
+        memoryText = `Memory refresh warning: ${e?.message || String(e)}`;
+      }
+      await ctx.reply(trimOut(`${syncText}\n\n${memoryText}`));
     } catch (e) {
       await ctx.reply(`Sync error: ${e?.message || String(e)}`);
+    }
+  });
+
+  bot.command("memory", async (ctx) => {
+    if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
+    const txt = (ctx.message?.text || "").trim();
+    const m = txt.match(/^\/memory(?:@\w+)?\s+(\d{1,2})\s*$/i);
+    const count = m ? parseInt(m[1], 10) : 24;
+    await ctx.reply(`Refreshing memory bank from last ${count} meetings...`);
+    try {
+      const info = await refreshMemoryBankFromRecentMeetings(count);
+      await ctx.reply(trimOut(info));
+    } catch (e) {
+      await ctx.reply(`Memory refresh error: ${e?.message || String(e)}`);
     }
   });
 
@@ -858,6 +1249,7 @@ async function main() {
             "Commands:\n" +
             "/status — show Fellow sync status\n" +
             "/sync — sync meetings/transcripts cache\n" +
+            "/memory [N] — refresh local memory bank from last N meetings\n" +
             "/transcript <title> — get meeting transcript\n" +
             "/ask <question> — ask in groups (works even with privacy mode)\n" +
             "Tip: ask 'weekly trends' for a 7-day summary.\n" +
@@ -889,9 +1281,29 @@ async function main() {
             include_transcripts: true,
             page_size: 20,
           });
-          await ctx.reply(trimOut(extractTextFromToolResult(res)));
+          const syncText = trimOut(extractTextFromToolResult(res));
+          let memoryText = "";
+          try {
+            memoryText = await refreshMemoryBankFromRecentMeetings(24);
+          } catch (e) {
+            memoryText = `Memory refresh warning: ${e?.message || String(e)}`;
+          }
+          await ctx.reply(trimOut(`${syncText}\n\n${memoryText}`));
         } catch (e) {
           await ctx.reply(`Sync error: ${e?.message || String(e)}`);
+        }
+        return;
+      }
+
+      if (/^\/memory(?:@\w+)?(?:\s|$)/i.test(lower)) {
+        const m = txt.match(/^\/memory(?:@\w+)?\s+(\d{1,2})\s*$/i);
+        const count = m ? parseInt(m[1], 10) : 24;
+        await ctx.reply(`Refreshing memory bank from last ${count} meetings...`);
+        try {
+          const info = await refreshMemoryBankFromRecentMeetings(count);
+          await ctx.reply(trimOut(info));
+        } catch (e) {
+          await ctx.reply(`Memory refresh error: ${e?.message || String(e)}`);
         }
         return;
       }
