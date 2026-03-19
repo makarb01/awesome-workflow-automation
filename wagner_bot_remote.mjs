@@ -1057,12 +1057,13 @@ async function importActionItemsToAsanaFromContext({ question = "", chatId = "",
     existingCoreSet.add(normalizedCore);
     if (normalizedOriginal) existingCoreSet.add(normalizedOriginal);
     if (stem) existingStemSet.add(stem);
-    createdLines.push(`- ${task?.name || asanaTitle} (id: ${task?.gid || "n/a"})`);
+    createdLines.push(`- ${task?.name || asanaTitle}`);
   }
 
-  const header = `✅ Asana sync complete for action items (${ASANA_PROJECT_NAME}).`;
-  const stats = `Created: ${created}, skipped as duplicates: ${skippedDuplicates}, extracted: ${dedup.length}.`;
-  const body = createdLines.length ? `\n\nCreated tasks:\n${createdLines.join("\n")}` : "";
+  const header = `✅ Action items synced to Asana board: ${ASANA_PROJECT_NAME}`;
+  const stats =
+    `Created ${created} new task(s), skipped ${skippedDuplicates} duplicate(s), extracted ${dedup.length} action item(s).`;
+  const body = createdLines.length ? `\n\nNew tasks:\n${createdLines.join("\n")}` : "";
   return `${header}\n${stats}${body}`;
 }
 
@@ -2285,9 +2286,8 @@ async function handleAsanaTaskAddCommand(ctx, rawText = "") {
   }
   const created = await createAsanaTask(payload);
   const title = created?.name || "(untitled)";
-  const gid = created?.gid || "n/a";
-  const due = created?.due_on ? `, due ${created.due_on}` : "";
-  await ctx.reply(trimOut(`✅ Task created: ${title}${due} (id: ${gid})`));
+  const due = created?.due_on ? ` (due ${created.due_on})` : "";
+  await ctx.reply(trimOut(`✅ Task created in ${ASANA_PROJECT_NAME}: ${title}${due}`));
 }
 
 async function handleAsanaTaskDoneCommand(ctx, rawText = "") {
