@@ -699,8 +699,10 @@ function startAsanaOverdueMonitor(bot) {
     }
   };
 
-  setTimeout(runner, Math.max(0, ASANA_OVERDUE_STARTUP_DELAY_MS));
-  setInterval(runner, everyMs);
+  const startupTimer = setTimeout(runner, Math.max(0, ASANA_OVERDUE_STARTUP_DELAY_MS));
+  const intervalTimer = setInterval(runner, everyMs);
+  if (typeof startupTimer.unref === "function") startupTimer.unref();
+  if (typeof intervalTimer.unref === "function") intervalTimer.unref();
 }
 
 function normalizeQuestionText(raw) {
