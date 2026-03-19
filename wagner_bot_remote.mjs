@@ -756,6 +756,33 @@ function stripLikelyOwnerPrefix(title) {
   return m ? m[2].trim() : t;
 }
 
+function titleStem(text, words = 6) {
+  const norm = normalizeTaskTitle(stripLikelyOwnerPrefix(text));
+  if (!norm) return "";
+  const chunks = norm.split(/\s+/).filter(Boolean);
+  return chunks.slice(0, Math.max(1, words)).join(" ");
+}
+
+function buildShortAsanaTaskTitle(item) {
+  const owner = String(item?.owner || "").trim();
+  let core = String(item?.title || "")
+    .replace(/\(assigned to:[^)]+\)/ig, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  core = core
+    .replace(/^(to\s+)?(purchase|create|document|notify|contact|send|get|ask|prepare|add|share|verify)\s+/i, (m) => m.trim() + " ")
+    .replace(/\s+(then|and then)\s+.*$/i, "")
+    .replace(/\s+for\s+future\s+reference.*$/i, "")
+    .replace(/\s*\(.*?\)\s*$/i, "")
+    .trim();
+
+  const words = core.split(/\s+/).filter(Boolean);
+  const shortCore = words.slice(0, 8).join(" ");
+  const finalCore = shortCore || core || "Action item";
+  return owner ? `${owner}: ${finalCore}` : finalCore;
+}
+
 function extractActionItemsSection(text) {
   const src = String(text || "");
   if (!src.trim()) return "";
@@ -904,15 +931,24 @@ async function importActionItemsToAsanaFromContext({ question = "", chatId = "",
   const existingOpenTasks = await listAsanaTasks("current", 120);
   const existingSet = new Set(existingOpenTasks.map((t) => normalizeTaskTitle(t?.name || "")));
   const existingCoreSet = new Set(existingOpenTasks.map((t) => normalizeTaskTitle(stripLikelyOwnerPrefix(t?.name || ""))));
+  const existingStemSet = new Set(existingOpenTasks.map((t) => titleStem(t?.name || "", 6)));
 
   let created = 0;
   let skippedDuplicates = 0;
   const createdLines = [];
   for (const item of dedup) {
-    const asanaTitle = item.owner ? `${item.owner}: ${item.title}` : item.title;
+    const asanaTitle = buildShortAsanaTaskTitle(item);
+    const originalTitle = item.owner ? `${item.owner}: ${item.title}` : item.title;
     const normalizedTitle = normalizeTaskTitle(asanaTitle);
     const normalizedCore = normalizeTaskTitle(stripLikelyOwnerPrefix(asanaTitle));
-    if (existingSet.has(normalizedTitle) || existingCoreSet.has(normalizedCore)) {
+    const normalizedOriginal = normalizeTaskTitle(originalTitle);
+    const stem = titleStem(asanaTitle, 6);
+    if (
+      existingSet.has(normalizedTitle) ||
+      existingCoreSet.has(normalizedCore) ||
+      existingCoreSet.has(normalizedOriginal) ||
+      (stem && existingStemSet.has(stem))
+    ) {
       skippedDuplicates += 1;
       continue;
     }
@@ -920,12 +956,15 @@ async function importActionItemsToAsanaFromContext({ question = "", chatId = "",
       `Source: ${item.source || "meeting context"}`,
       `Created by Telegram bot from /ask request.`,
       `Original action item: ${item.title}`,
-    ].join("\n");
+      item.owner ? `Owner: ${item.owner}` : "",
+    ].filter(Boolean).join("\n");
 
     const task = await createAsanaTaskWithFields({ name: asanaTitle, notes });
     created += 1;
     existingSet.add(normalizedTitle);
     existingCoreSet.add(normalizedCore);
+    if (normalizedOriginal) existingCoreSet.add(normalizedOriginal);
+    if (stem) existingStemSet.add(stem);
     createdLines.push(`- ${task?.name || asanaTitle} (id: ${task?.gid || "n/a"})`);
   }
 
