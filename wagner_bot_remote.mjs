@@ -33,6 +33,13 @@ const MEMORY_BANK_JSON = path.join(MEMORY_BANK_DIR, "meetings.json");
 const MEMORY_BANK_MD = path.join(MEMORY_BANK_DIR, "meetings.md");
 const MEMORY_BANK_MAX_ITEMS = parseInt(process.env.MEMORY_BANK_MAX_ITEMS || "120", 10);
 const MEMORY_BANK_CONTEXT_ITEMS = parseInt(process.env.MEMORY_BANK_CONTEXT_ITEMS || "8", 10);
+const ENABLE_FELLOW_NATIVE_AI = (process.env.ENABLE_FELLOW_NATIVE_AI || "1") === "1";
+
+const MCP_TOOL_CACHE = {
+  names: null,
+  fetchedAt: 0,
+};
+const MCP_TOOL_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const ACCOUNT_PROFILE_HINT_TERMS = [
   "meta",
@@ -155,6 +162,72 @@ async function callTool(name, args = {}) {
       `tool:${name}`,
     );
   });
+}
+
+async function listMcpToolNames() {
+  const now = Date.now();
+  if (MCP_TOOL_CACHE.names && now - MCP_TOOL_CACHE.fetchedAt < MCP_TOOL_CACHE_TTL_MS) {
+    return MCP_TOOL_CACHE.names;
+  }
+  const names = await withMcpClient(async (client) => {
+    const tools = await withTimeout(client.listTools(), 15000, "MCP listTools");
+    return (tools?.tools || []).map((t) => String(t?.name || "")).filter(Boolean);
+  });
+  MCP_TOOL_CACHE.names = names;
+  MCP_TOOL_CACHE.fetchedAt = now;
+  return names;
+}
+
+function detectFellowAskToolName(toolNames) {
+  const names = Array.isArray(toolNames) ? toolNames : [];
+  const preferred = [
+    "ask_ai",
+    "ask_fellow_ai",
+    "ask",
+    "chat_with_ai",
+    "chat",
+    "ask_question",
+  ];
+  for (const p of preferred) {
+    if (names.includes(p)) return p;
+  }
+  const fuzzy = names.find((n) => /(ask|chat).*(ai)?/i.test(n));
+  return fuzzy || "";
+}
+
+async function tryNativeFellowAi(question, options = {}) {
+  if (!ENABLE_FELLOW_NATIVE_AI) return "";
+  const toolNames = await listMcpToolNames();
+  const askTool = detectFellowAskToolName(toolNames);
+  if (!askTool) return "";
+
+  const requestedCalls = Number.isInteger(options.requestedCalls) ? options.requestedCalls : null;
+  const focusTerms = Array.isArray(options.focusTerms) ? options.focusTerms : [];
+
+  const scopeHint = [
+    requestedCalls ? `Limit analysis to last ${requestedCalls} calls.` : "",
+    focusTerms.length ? `Focus strictly on: ${focusTerms.join(", ")}.` : "",
+  ].filter(Boolean).join(" ");
+  const fullQuestion = scopeHint ? `${question}\n\nContext instructions: ${scopeHint}` : question;
+
+  const candidates = [
+    { question: fullQuestion },
+    { query: fullQuestion },
+    { prompt: fullQuestion },
+    { input: fullQuestion },
+    { text: fullQuestion },
+  ];
+
+  for (const args of candidates) {
+    try {
+      const res = await callTool(askTool, args);
+      const txt = extractTextFromToolResult(res).trim();
+      if (txt) return txt;
+    } catch {
+      // try next argument shape
+    }
+  }
+  return "";
 }
 
 function normalizeQuestionText(raw) {
@@ -887,7 +960,15 @@ async function answerQuestion(question, chatId = "") {
   const requestedCalls = parseRequestedCallCount(safeQuestion) || (asksForRecentCalls(safeQuestion) ? 5 : null);
   const focusTerms = buildFocusTerms(safeQuestion);
   const transcriptRequested = looksLikeTranscriptRequest(safeQuestion);
+  const wantsQuotedEvidence = /\b(quote|quoted|verbatim|exact|where was|who said)\b/i.test(safeQuestion);
   const meetingFetchLimit = Math.max(30, (requestedCalls || 5) + 16);
+
+  try {
+    const nativeAnswer = await tryNativeFellowAi(safeQuestion, { requestedCalls, focusTerms });
+    if (nativeAnswer) return trimOut(nativeAnswer);
+  } catch (e) {
+    console.log(`Native Fellow AI path failed: ${e?.message || String(e)}`);
+  }
 
   const meetingsRes = await callTool("search_meetings", { limit: meetingFetchLimit });
   const meetingsText = extractTextFromToolResult(meetingsRes);
@@ -903,7 +984,7 @@ async function answerQuestion(question, chatId = "") {
     selectedMeetings = base.slice(0, requestedCalls);
   } else if (focusTerms.length) {
     const base = rankedMeetings.length ? rankedMeetings : allMeetings;
-    selectedMeetings = sortMeetingsByDateDesc(base).slice(0, 6);
+    selectedMeetings = sortMeetingsByDateDesc(base).slice(0, 5);
   } else {
     selectedMeetings = (rankedMeetings.length ? rankedMeetings : allMeetings).slice(0, 3);
   }
@@ -966,13 +1047,18 @@ async function answerQuestion(question, chatId = "") {
 
   const shouldPullTranscriptEvidence =
     focusTerms.length > 0 &&
-    /(account|profile|meta|business manager|bm|ad account|pixel|page)/i.test(safeQuestion);
+    /(account|profile|meta|business manager|bm|ad account|pixel|page)/i.test(safeQuestion) &&
+    wantsQuotedEvidence;
+  const transcriptEvidenceLimit = shouldPullTranscriptEvidence
+    ? Math.max(1, Math.min(2, selectedMeetings.length))
+    : 0;
 
   const freshSnapshots = [];
   let focusedHits = 0;
-  for (const m of selectedMeetings) {
+  for (let i = 0; i < selectedMeetings.length; i += 1) {
+    const m = selectedMeetings[i];
     const evidence = await buildMeetingEvidence(m, {
-      includeTranscript: shouldPullTranscriptEvidence,
+      includeTranscript: i < transcriptEvidenceLimit,
       focusTerms,
     });
     if (evidence?.text) contextBlocks.push(evidence.text);
@@ -1142,6 +1228,7 @@ async function main() {
   });
 
   bot.start(async (ctx) => {
+    ctx.state.handledCommand = true;
     if (!isAllowedChat(ctx)) {
       await ctx.reply("Access is not allowed in this chat.");
       return;
@@ -1160,11 +1247,13 @@ async function main() {
   });
 
   bot.command("ping", async (ctx) => {
+    ctx.state.handledCommand = true;
     if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
     await ctx.reply("pong ✅");
   });
 
   bot.command("status", async (ctx) => {
+    ctx.state.handledCommand = true;
     if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
     try {
       const res = await callTool("get_sync_status", {});
@@ -1175,6 +1264,7 @@ async function main() {
   });
 
   bot.command("sync", async (ctx) => {
+    ctx.state.handledCommand = true;
     if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
     await ctx.reply("Running sync_meetings (including transcripts)...");
     try {
@@ -1197,6 +1287,7 @@ async function main() {
   });
 
   bot.command("memory", async (ctx) => {
+    ctx.state.handledCommand = true;
     if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
     const txt = (ctx.message?.text || "").trim();
     const m = txt.match(/^\/memory(?:@\w+)?\s+(\d{1,2})\s*$/i);
@@ -1211,6 +1302,7 @@ async function main() {
   });
 
   bot.command("ask", async (ctx) => {
+    ctx.state.handledCommand = true;
     if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
     const txt = (ctx.message?.text || "").trim();
     const q = normalizeQuestionText(txt.replace(/^\/ask(?:@\w+)?\s*/i, ""));
@@ -1222,6 +1314,7 @@ async function main() {
   });
 
   bot.command("transcript", async (ctx) => {
+    ctx.state.handledCommand = true;
     if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
     const txt = (ctx.message?.text || "").trim();
     const title = txt.replace(/^\/transcript\s*/i, "").trim();
@@ -1240,6 +1333,7 @@ async function main() {
   });
 
   bot.on("text", async (ctx) => {
+    if (ctx.state?.handledCommand) return;
     const txt = (ctx.message?.text || "").trim();
     if (!txt) return;
 
