@@ -44,7 +44,9 @@ const ENABLE_ASANA = (process.env.ENABLE_ASANA || "1") === "1";
 const ASANA_API_BASE = process.env.ASANA_API_BASE || "https://app.asana.com/api/1.0";
 const ASANA_ACCESS_TOKEN = process.env.ASANA_ACCESS_TOKEN || process.env.ASANA_TOKEN || "";
 const ASANA_WORKSPACE_GID = process.env.ASANA_WORKSPACE_GID || "";
-const ASANA_PROJECT_NAME = process.env.ASANA_PROJECT_NAME || "General Tasks";
+const ASANA_PROJECT_NAME = (process.env.ASANA_PROJECT_NAME || "General Tasks")
+  .trim()
+  .replace(/^["']|["']$/g, "");
 const ASANA_TASK_LIST_LIMIT = parseInt(process.env.ASANA_TASK_LIST_LIMIT || "20", 10);
 const ASANA_OVERDUE_ENABLED = (process.env.ASANA_OVERDUE_ENABLED || "1") === "1";
 const ASANA_OVERDUE_INTERVAL_MINUTES = parseInt(process.env.ASANA_OVERDUE_INTERVAL_MINUTES || "30", 10);
@@ -55,11 +57,11 @@ const ASANA_OVERDUE_THRESHOLDS = (process.env.ASANA_OVERDUE_THRESHOLDS || "0,2,7
   .sort((a, b) => a - b);
 const ASANA_OVERDUE_SECTION_NAMES = (process.env.ASANA_OVERDUE_SECTION_NAMES || "To Do,Doing")
   .split(",")
-  .map((x) => x.trim().toLowerCase())
+  .map((x) => x.trim().replace(/^["']|["']$/g, "").toLowerCase())
   .filter(Boolean);
 const ASANA_OVERDUE_ALERT_CHAT_IDS = (process.env.ASANA_OVERDUE_ALERT_CHAT_IDS || "")
   .split(",")
-  .map((x) => x.trim())
+  .map((x) => x.trim().replace(/^["']|["']$/g, ""))
   .filter(Boolean);
 const ASANA_OVERDUE_STATE_FILE = process.env.ASANA_OVERDUE_STATE_FILE || path.join(MEMORY_BANK_DIR, "asana-overdue-state.json");
 const ASANA_OVERDUE_MAX_TASKS = parseInt(process.env.ASANA_OVERDUE_MAX_TASKS || "80", 10);
