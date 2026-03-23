@@ -14,6 +14,7 @@ const FELLOW_SUBDOMAIN = process.env.FELLOW_SUBDOMAIN || "wagner";
 const FELLOW_MODE = (process.env.FELLOW_MODE || "stdio").toLowerCase();
 const FELLOW_MCP_URL = process.env.FELLOW_MCP_URL || "https://fellow.app/mcp";
 const MAX_REPLY_LEN = parseInt(process.env.MAX_REPLY_LEN || "3600", 10);
+const TELEGRAM_SAFE_MESSAGE_LEN = parseInt(process.env.TELEGRAM_SAFE_MESSAGE_LEN || "3900", 10);
 const DRY_RUN = process.env.DRY_RUN === "1";
 const ALLOWED_CHAT_IDS = new Set(
   (process.env.ALLOWED_CHAT_IDS || "")
@@ -140,8 +141,9 @@ function isAllowedChat(ctx) {
 
 function trimOut(text) {
   if (!text) return "(empty response)";
-  return text.length > MAX_REPLY_LEN
-    ? `${text.slice(0, MAX_REPLY_LEN)}\n\n…[truncated]`
+  const hardLimit = Math.max(500, Math.min(MAX_REPLY_LEN, TELEGRAM_SAFE_MESSAGE_LEN));
+  return text.length > hardLimit
+    ? `${text.slice(0, hardLimit)}\n\n…[truncated]`
     : text;
 }
 
