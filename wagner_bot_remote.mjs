@@ -2399,10 +2399,13 @@ async function handleIncomingText(ctx, text) {
     await appendChatHistory(chatId, "assistant", out);
   } catch (err) {
     const msg = err?.message || String(err);
-    const out = trimOut(
-      `Error while querying Fellow MCP: ${msg}\n\n` +
-        "Check FELLOW_API_KEY and FELLOW_SUBDOMAIN (stdio mode), or auth for FELLOW_MCP_URL (http mode).",
-    );
+    const isTelegramTooLong = /message is too long/i.test(msg);
+    const out = isTelegramTooLong
+      ? "Telegram message limit reached while sending response. Please retry; the bot will send a shorter answer."
+      : trimOut(
+          `Error while querying Fellow MCP: ${msg}\n\n` +
+            "Check FELLOW_API_KEY and FELLOW_SUBDOMAIN (stdio mode), or auth for FELLOW_MCP_URL (http mode).",
+        );
     await ctx.reply(out);
     const chatId = String(ctx.chat?.id || "");
     await appendChatHistory(chatId, "assistant", out);
