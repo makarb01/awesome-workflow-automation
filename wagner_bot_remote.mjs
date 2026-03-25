@@ -2475,6 +2475,23 @@ async function refreshMemoryBankFromRecentMeetings(limit = 20) {
   return `Memory bank refreshed with ${snapshots.length} meetings. Files: ${MEMORY_BANK_JSON}, ${MEMORY_BANK_MD}`;
 }
 
+async function runSyncCommandAndReply(ctx, syncRes) {
+  const syncText = trimOut(extractTextFromToolResult(syncRes));
+  await ctx.reply(syncText);
+
+  // Run memory refresh in background-ish flow with its own timeout and follow-up message.
+  try {
+    const memoryText = await withTimeout(
+      refreshMemoryBankFromRecentMeetings(24),
+      45000,
+      "memory refresh",
+    );
+    await ctx.reply(trimOut(memoryText));
+  } catch (e) {
+    await ctx.reply(trimOut(`Memory refresh warning: ${e?.message || String(e)}`));
+  }
+}
+
 function parseTasksMode(rawText = "") {
   const t = String(rawText || "").toLowerCase();
   if (/\bdone|completed|closed|finished\b/.test(t)) return "done";
@@ -2512,7 +2529,46 @@ async function handleAsanaTaskDoneCommand(ctx, rawText = "") {
     return;
   }
   const updated = await markAsanaTaskDone(gid);
-  await ctx.reply(trimOut(`✅ Task marked done: ${updated?.name || gid} (id: ${updated?.gid || gid})`));
+  await ctx.reply(trimOut(`✅ Task marked done: ${updated?.name || gid}`));
+}
+
+async function runSyncCommandFlow(ctx, refreshCount = 12) {
+  await ctx.reply("Running sync_meetings (including transcripts)...");
+  let syncText = "";
+  try {
+    const res = await withTimeout(
+      callTool("sync_meetings", {
+        force: false,
+        include_transcripts: true,
+        page_size: 20,
+      }),
+      90000,
+      "sync_meetings",
+    );
+    syncText = trimOut(extractTextFromToolResult(res));
+    await ctx.reply(syncText);
+  } catch (e) {
+    await ctx.reply(`Sync error: ${e?.message || String(e)}`);
+    return;
+  }
+
+  const chatId = String(ctx.chat?.id || "");
+  const botApi = ctx.telegram;
+  setTimeout(async () => {
+    try {
+      const info = await withTimeout(
+        refreshMemoryBankFromRecentMeetings(refreshCount),
+        45000,
+        "memory refresh",
+      );
+      await botApi.sendMessage(chatId, trimOut(`📚 ${info}`));
+    } catch (e) {
+      await botApi.sendMessage(
+        chatId,
+        trimOut(`Memory refresh warning: ${e?.message || String(e)}`),
+      );
+    }
+  }, 0);
 }
 
 async function runDryRun() {
@@ -2532,6 +2588,23 @@ async function runDryRun() {
   }
 
   console.log("Dry run complete.");
+}
+
+async function runSyncFlowWithDeferredMemory(ctx, syncRes) {
+  const syncText = trimOut(extractTextFromToolResult(syncRes));
+  await ctx.reply(syncText || "Sync completed.");
+
+  try {
+    await ctx.reply("Refreshing local memory bank in background...");
+    const memoryText = await withTimeout(
+      refreshMemoryBankFromRecentMeetings(24),
+      30000,
+      "memory refresh",
+    );
+    await ctx.reply(trimOut(memoryText));
+  } catch (e) {
+    await ctx.reply(trimOut(`Memory refresh warning: ${e?.message || String(e)}`));
+  }
 }
 
 async function main() {
@@ -2618,24 +2691,7 @@ async function main() {
   bot.command("sync", async (ctx) => {
     ctx.state.handledCommand = true;
     if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
-    await ctx.reply("Running sync_meetings (including transcripts)...");
-    try {
-      const res = await callTool("sync_meetings", {
-        force: false,
-        include_transcripts: true,
-        page_size: 20,
-      });
-      const syncText = trimOut(extractTextFromToolResult(res));
-      let memoryText = "";
-      try {
-        memoryText = await refreshMemoryBankFromRecentMeetings(24);
-      } catch (e) {
-        memoryText = `Memory refresh warning: ${e?.message || String(e)}`;
-      }
-      await ctx.reply(trimOut(`${syncText}\n\n${memoryText}`));
-    } catch (e) {
-      await ctx.reply(`Sync error: ${e?.message || String(e)}`);
-    }
+    await runSyncCommandFlow(ctx, 24);
   });
 
   bot.command("memory", async (ctx) => {
@@ -2790,24 +2846,7 @@ async function main() {
       }
 
       if (/^\/sync(?:@\w+)?(?:\s|$)/i.test(lower)) {
-        await ctx.reply("Running sync_meetings (including transcripts)...");
-        try {
-          const res = await callTool("sync_meetings", {
-            force: false,
-            include_transcripts: true,
-            page_size: 20,
-          });
-          const syncText = trimOut(extractTextFromToolResult(res));
-          let memoryText = "";
-          try {
-            memoryText = await refreshMemoryBankFromRecentMeetings(24);
-          } catch (e) {
-            memoryText = `Memory refresh warning: ${e?.message || String(e)}`;
-          }
-          await ctx.reply(trimOut(`${syncText}\n\n${memoryText}`));
-        } catch (e) {
-          await ctx.reply(`Sync error: ${e?.message || String(e)}`);
-        }
+        await runSyncCommandFlow(ctx, 24);
         return;
       }
 
