@@ -1278,6 +1278,35 @@ function summaryToHighlights(text, maxLines = 12) {
   return clipText(lines.slice(0, maxLines).join("\n"), 1300);
 }
 
+function transcriptCoverageSnippet(transcript, maxChars = 3200) {
+  const src = String(transcript || "").trim();
+  if (!src) return "";
+  const lines = src
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (!lines.length) return "";
+  if (lines.length <= 90) return clipText(lines.join("\n"), maxChars);
+
+  const take = 28;
+  const head = lines.slice(0, take);
+  const midStart = Math.max(0, Math.floor(lines.length / 2) - Math.floor(take / 2));
+  const mid = lines.slice(midStart, midStart + take);
+  const tail = lines.slice(-take);
+
+  const merged = [
+    "[Beginning]",
+    ...head,
+    "",
+    "[Middle]",
+    ...mid,
+    "",
+    "[End]",
+    ...tail,
+  ].join("\n");
+  return clipText(merged, maxChars);
+}
+
 function getChatMemoryContext(chatId) {
   if (!chatId) return "";
   const key = String(chatId);
@@ -1450,6 +1479,17 @@ function splitIntoEvidenceLines(text) {
     .filter((line) => !/^(Note ID|Recording ID|Event Start|Fellow URL|Language):/i.test(line))
     .filter((line) => !/^\[\d{2}:\d{2}\s*-\s*\d{2}:\d{2}\]/.test(line))
     .filter((line) => !/^\((The things to talk about|What came out of this meeting)/i.test(line));
+}
+
+function selectTranscriptCoverageLines(transcript, maxLines = 140) {
+  const lines = String(transcript || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/^language\s*:/i.test(line))
+    .filter((line) => !/^\[\d{2}:\d{2}\s*-\s*\d{2}:\d{2}\]\s*$/.test(line));
+  if (!lines.length) return [];
+  return lines.slice(0, Math.max(20, maxLines));
 }
 
 function buildFocusTerms(question) {
@@ -2292,15 +2332,17 @@ async function answerQuestion(question, chatId = "") {
     console.log(`Memory bank read failed: ${e?.message || String(e)}`);
   }
 
+  const summaryFullCoverage = detailedSummaryRequested || looksLikeSummaryQuestion(safeQuestion);
+  const evidenceFocusTerms = summaryFullCoverage ? [] : focusTerms;
   const shouldPullTranscriptEvidence =
     (
       (focusTerms.length > 0 &&
         /(account|profile|meta|business manager|bm|ad account|pixel|page)/i.test(safeQuestion) &&
         wantsQuotedEvidence) ||
-      detailedSummaryRequested
+      summaryFullCoverage
     );
   const transcriptEvidenceLimit = shouldPullTranscriptEvidence
-    ? Math.max(1, Math.min(detailedSummaryRequested ? 2 : 2, selectedMeetings.length))
+    ? Math.max(1, Math.min(summaryFullCoverage ? 3 : 2, selectedMeetings.length))
     : 0;
 
   const freshSnapshots = [];
@@ -2309,7 +2351,7 @@ async function answerQuestion(question, chatId = "") {
     const m = selectedMeetings[i];
     const evidence = await buildMeetingEvidence(m, {
       includeTranscript: i < transcriptEvidenceLimit,
-      focusTerms,
+      focusTerms: evidenceFocusTerms,
       detailedMode: detailedSummaryRequested || coordinatorRequested,
     });
     if (evidence?.text) contextBlocks.push(evidence.text);
