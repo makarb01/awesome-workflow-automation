@@ -89,6 +89,15 @@ const REFUND_CONFIRM_KEYWORDS = (process.env.REFUND_CONFIRM_KEYWORDS || "refund,
   .split(",")
   .map((x) => x.trim().toLowerCase())
   .filter(Boolean);
+const BOT_USERNAME_ENV = (process.env.BOT_USERNAME || "")
+  .replace(/^@/, "")
+  .trim()
+  .toLowerCase();
+const REFUND_ALLOWED_BOT_USERNAME = (process.env.REFUND_ALLOWED_BOT_USERNAME || "aiassitant_shadow_bot")
+  .replace(/^@/, "")
+  .trim()
+  .toLowerCase();
+const REFUND_FEATURE_ENABLED = REFUND_CONFIRMATION_ENABLED && BOT_USERNAME_ENV === REFUND_ALLOWED_BOT_USERNAME;
 
 const MCP_TOOL_CACHE = {
   names: null,
@@ -169,6 +178,38 @@ function trimOut(text) {
   return text.length > hardLimit
     ? `${text.slice(0, hardLimit)}\n\n…[truncated]`
     : text;
+}
+
+function isRefundWorkflowEnabled() {
+  return REFUND_FEATURE_ENABLED;
+}
+
+function getStartHelpText() {
+  const refundCommands = isRefundWorkflowEnabled()
+    ? "/refunds — list refund confirmations pending approval\n" +
+      "/refund_confirm <thread_id> [note] — approve refund\n" +
+      "/refund_reject <thread_id> [note] — reject refund\n" +
+      "/refund_clear <thread_id> — clear prior confirmation state\n"
+    : "";
+  return (
+    "Hi! I'm a bot for questions about Fellow transcripts.\n\n" +
+    "Commands:\n" +
+    "/status — show Fellow sync status\n" +
+    "/sync — sync meetings/transcripts cache\n" +
+    "/memory [N] — refresh local memory bank from last N meetings\n" +
+    "/tasks [current|done|all] — list Asana tasks from General Tasks\n" +
+    "/task_add <title> [due:YYYY-MM-DD] — create Asana task\n" +
+    "/task_done <task_id> — mark Asana task as completed\n" +
+    refundCommands +
+    "/overdue_check [all] — run overdue check for To Do/Doing now\n" +
+    "/transcript <title> — get meeting transcript\n" +
+    "/ask <question> — ask in groups (works even with privacy mode)\n" +
+    "Overdue thresholds (days): " +
+    ASANA_OVERDUE_THRESHOLDS.join(", ") +
+    "\n" +
+    "Tip: ask 'weekly trends' for a 7-day summary.\n" +
+    "Or just send a free-form question."
+  );
 }
 
 function extractTextFromToolResult(result) {
@@ -1037,7 +1078,7 @@ async function resolveRefundAlertChatIds() {
 }
 
 async function runRefundConfirmationCheck(bot, { force = false, targetChatId = "" } = {}) {
-  if (!REFUND_CONFIRMATION_ENABLED) return { sent: 0, total: 0, reason: "disabled" };
+  if (!isRefundWorkflowEnabled()) return { sent: 0, total: 0, reason: "disabled_for_this_bot" };
   await ensureRefundAlertStateLoaded();
   const pending = await getPendingRefundConfirmations(REFUND_MAX_PENDING);
   if (!pending.length) return { sent: 0, total: 0, reason: "none_pending" };
@@ -1080,7 +1121,7 @@ async function runRefundConfirmationCheck(bot, { force = false, targetChatId = "
 }
 
 function startRefundConfirmationMonitor(bot) {
-  if (!REFUND_CONFIRMATION_ENABLED) return;
+  if (!isRefundWorkflowEnabled()) return;
   const everyMs = Math.max(5, REFUND_ALERT_INTERVAL_MINUTES) * 60 * 1000;
   const runner = async () => {
     try {
@@ -2762,6 +2803,10 @@ function actorFromCtx(ctx) {
 }
 
 async function handleRefundsCommand(ctx) {
+  if (!isRefundWorkflowEnabled()) {
+    await ctx.reply(`Refund confirmations are enabled only in @${REFUND_ALLOWED_BOT_USERNAME}.`);
+    return;
+  }
   const pending = await getPendingRefundConfirmations(REFUND_MAX_PENDING);
   if (!pending.length) {
     await ctx.reply("✅ No pending refund confirmations right now.");
@@ -2779,6 +2824,10 @@ async function handleRefundsCommand(ctx) {
 }
 
 async function handleRefundConfirmCommand(ctx, rawText = "") {
+  if (!isRefundWorkflowEnabled()) {
+    await ctx.reply(`Refund confirmations are enabled only in @${REFUND_ALLOWED_BOT_USERNAME}.`);
+    return;
+  }
   const txt = String(rawText || "").trim();
   const m = txt.match(/^([A-Za-z0-9_-]+)\s*(.*)$/);
   if (!m) {
@@ -2792,6 +2841,10 @@ async function handleRefundConfirmCommand(ctx, rawText = "") {
 }
 
 async function handleRefundRejectCommand(ctx, rawText = "") {
+  if (!isRefundWorkflowEnabled()) {
+    await ctx.reply(`Refund confirmations are enabled only in @${REFUND_ALLOWED_BOT_USERNAME}.`);
+    return;
+  }
   const txt = String(rawText || "").trim();
   const m = txt.match(/^([A-Za-z0-9_-]+)\s*(.*)$/);
   if (!m) {
@@ -2805,6 +2858,10 @@ async function handleRefundRejectCommand(ctx, rawText = "") {
 }
 
 async function handleRefundClearCommand(ctx, rawText = "") {
+  if (!isRefundWorkflowEnabled()) {
+    await ctx.reply(`Refund confirmations are enabled only in @${REFUND_ALLOWED_BOT_USERNAME}.`);
+    return;
+  }
   const threadId = String(rawText || "").trim();
   if (!threadId) {
     await ctx.reply("Usage: /refund_clear <thread_id>");
@@ -2935,26 +2992,7 @@ async function main() {
       await ctx.reply("Access is not allowed in this chat.");
       return;
     }
-    await ctx.reply(
-      "Hi! I'm a bot for questions about Fellow transcripts.\n\n" +
-        "Commands:\n" +
-        "/status — show Fellow sync status\n" +
-        "/sync — sync meetings/transcripts cache\n" +
-        "/memory [N] — refresh local memory bank from last N meetings\n" +
-        "/tasks [current|done|all] — list Asana tasks from General Tasks\n" +
-        "/task_add <title> [due:YYYY-MM-DD] — create Asana task\n" +
-        "/task_done <task_id> — mark Asana task as completed\n" +
-        "/refunds — list refund confirmations pending approval\n" +
-        "/refund_confirm <thread_id> [note] — approve refund\n" +
-        "/refund_reject <thread_id> [note] — reject refund\n" +
-        "/refund_clear <thread_id> — clear prior confirmation state\n" +
-        "/overdue_check [all] — run overdue check for To Do/Doing now\n" +
-        "/transcript <title> — get meeting transcript\n" +
-        "/ask <question> — ask in groups (works even with privacy mode)\n" +
-        "Overdue thresholds (days): " + ASANA_OVERDUE_THRESHOLDS.join(", ") + "\n" +
-        "Tip: ask 'weekly trends' for a 7-day summary.\n" +
-        "Or just send a free-form question.",
-    );
+    await ctx.reply(getStartHelpText());
   });
 
   bot.command("ping", async (ctx) => {
@@ -3030,6 +3068,7 @@ async function main() {
 
   bot.command("refunds", async (ctx) => {
     ctx.state.handledCommand = true;
+    if (!isRefundWorkflowEnabled()) return ctx.reply("Refund workflow is disabled in this bot.");
     if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
     try {
       await handleRefundsCommand(ctx);
@@ -3040,6 +3079,7 @@ async function main() {
 
   bot.command("refund_confirm", async (ctx) => {
     ctx.state.handledCommand = true;
+    if (!isRefundWorkflowEnabled()) return ctx.reply("Refund workflow is disabled in this bot.");
     if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
     const txt = (ctx.message?.text || "").trim();
     try {
@@ -3051,6 +3091,7 @@ async function main() {
 
   bot.command("refund_reject", async (ctx) => {
     ctx.state.handledCommand = true;
+    if (!isRefundWorkflowEnabled()) return ctx.reply("Refund workflow is disabled in this bot.");
     if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
     const txt = (ctx.message?.text || "").trim();
     try {
@@ -3062,6 +3103,7 @@ async function main() {
 
   bot.command("refund_clear", async (ctx) => {
     ctx.state.handledCommand = true;
+    if (!isRefundWorkflowEnabled()) return ctx.reply("Refund workflow is disabled in this bot.");
     if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
     const txt = (ctx.message?.text || "").trim();
     try {
@@ -3140,26 +3182,7 @@ async function main() {
     // Fallback parser for group commands with @mentions, e.g. /start@wagner_fellow_bot
     if (txt.startsWith("/")) {
       if (/^\/start(?:@\w+)?(?:\s|$)/i.test(lower)) {
-        await ctx.reply(
-          "Hi! I'm a bot for questions about Fellow transcripts.\n\n" +
-            "Commands:\n" +
-            "/status — show Fellow sync status\n" +
-            "/sync — sync meetings/transcripts cache\n" +
-            "/memory [N] — refresh local memory bank from last N meetings\n" +
-            "/tasks [current|done|all] — list Asana tasks from General Tasks\n" +
-            "/task_add <title> [due:YYYY-MM-DD] — create Asana task\n" +
-            "/task_done <task_id> — mark Asana task as completed\n" +
-            "/refunds — list refund confirmations pending approval\n" +
-            "/refund_confirm <thread_id> [note] — approve refund\n" +
-            "/refund_reject <thread_id> [note] — reject refund\n" +
-            "/refund_clear <thread_id> — clear prior confirmation state\n" +
-            "/overdue_check [all] — run overdue check for To Do/Doing now\n" +
-            "/transcript <title> — get meeting transcript\n" +
-            "/ask <question> — ask in groups (works even with privacy mode)\n" +
-            "Overdue thresholds (days): " + ASANA_OVERDUE_THRESHOLDS.join(", ") + "\n" +
-            "Tip: ask 'weekly trends' for a 7-day summary.\n" +
-            "Or just send a free-form question.",
-        );
+        await ctx.reply(getStartHelpText());
         return;
       }
 
@@ -3340,7 +3363,9 @@ async function main() {
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
 
   startAsanaOverdueMonitor(bot);
-  startRefundConfirmationMonitor(bot);
+  if (isRefundWorkflowEnabled()) {
+    startRefundConfirmationMonitor(bot);
+  }
   await bot.launch({ dropPendingUpdates: true });
   console.log("wagner-fellow-bot started");
 }
