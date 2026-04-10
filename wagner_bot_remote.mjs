@@ -5,6 +5,8 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { promises as fs } from "fs";
 import path from "path";
+import { execFile } from "child_process";
+import { promisify } from "util";
 
 dotenv.config();
 
@@ -70,6 +72,23 @@ const ASANA_OVERDUE_STARTUP_DELAY_MS = parseInt(process.env.ASANA_OVERDUE_STARTU
 const ASANA_OVERDUE_ERROR_COOLDOWN_MS = parseInt(process.env.ASANA_OVERDUE_ERROR_COOLDOWN_MS || "21600000", 10);
 const ASANA_AUTO_ASSIGN_ENABLED = (process.env.ASANA_AUTO_ASSIGN_ENABLED || "1") === "1";
 const ASANA_ASSIGNEE_MAP_RAW = process.env.ASANA_ASSIGNEE_MAP || "";
+const SUPPORT_BRAIN_ENABLED = (process.env.SUPPORT_BRAIN_ENABLED || "1") === "1";
+const SUPPORT_BRAIN_SCRIPT_PATH = process.env.SUPPORT_BRAIN_SCRIPT_PATH || "/root/.openclaw/workspace/support_brain.py";
+const SUPPORT_BRAIN_PYTHON = process.env.SUPPORT_BRAIN_PYTHON || "python3";
+const REFUND_CONFIRMATION_ENABLED = (process.env.REFUND_CONFIRMATION_ENABLED || "1") === "1";
+const REFUND_CONFIRMATIONS_FILE = process.env.REFUND_CONFIRMATIONS_FILE || path.join(MEMORY_BANK_DIR, "refund-confirmations.json");
+const REFUND_ALERT_STATE_FILE = process.env.REFUND_ALERT_STATE_FILE || path.join(MEMORY_BANK_DIR, "refund-alert-state.json");
+const REFUND_ALERT_INTERVAL_MINUTES = parseInt(process.env.REFUND_ALERT_INTERVAL_MINUTES || "30", 10);
+const REFUND_ALERT_STARTUP_DELAY_MS = parseInt(process.env.REFUND_ALERT_STARTUP_SECONDS || "45", 10) * 1000;
+const REFUND_ALERT_CHAT_IDS = (process.env.REFUND_ALERT_CHAT_IDS || "")
+  .split(",")
+  .map((x) => x.trim().replace(/^["']|["']$/g, ""))
+  .filter(Boolean);
+const REFUND_MAX_PENDING = parseInt(process.env.REFUND_MAX_PENDING || "80", 10);
+const REFUND_CONFIRM_KEYWORDS = (process.env.REFUND_CONFIRM_KEYWORDS || "refund,chargeback,charged,billing,cancel,cancellation")
+  .split(",")
+  .map((x) => x.trim().toLowerCase())
+  .filter(Boolean);
 
 const MCP_TOOL_CACHE = {
   names: null,
@@ -88,6 +107,11 @@ const ASANA_OVERDUE_STATE = {
   task_notified_at: {},
 };
 let ASANA_USERS_CACHE = null;
+const execFileAsync = promisify(execFile);
+let REFUND_CONFIRMATIONS_LOADED = false;
+let REFUND_ALERT_STATE_LOADED = false;
+const REFUND_CONFIRMATIONS = { threads: {} };
+const REFUND_ALERT_STATE = { alerted: {} };
 
 const ACCOUNT_PROFILE_HINT_TERMS = [
   "meta",
@@ -869,6 +893,206 @@ function startAsanaOverdueMonitor(bot) {
   };
 
   const startupTimer = setTimeout(runner, Math.max(0, ASANA_OVERDUE_STARTUP_DELAY_MS));
+  const intervalTimer = setInterval(runner, everyMs);
+  if (typeof startupTimer.unref === "function") startupTimer.unref();
+  if (typeof intervalTimer.unref === "function") intervalTimer.unref();
+}
+
+async function runSupportBrain(args = [], timeoutMs = 120000) {
+  if (!SUPPORT_BRAIN_ENABLED) {
+    throw new Error("Support brain integration is disabled.");
+  }
+  const finalArgs = [SUPPORT_BRAIN_SCRIPT_PATH, ...args];
+  const { stdout, stderr } = await execFileAsync(SUPPORT_BRAIN_PYTHON, finalArgs, {
+    timeout: Math.max(1000, timeoutMs),
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  if (stderr && stderr.trim()) {
+    // Keep stderr as debug info only.
+    console.log(`support_brain stderr: ${stderr.trim().slice(0, 600)}`);
+  }
+  return String(stdout || "");
+}
+
+async function ensureRefundConfirmationsLoaded() {
+  if (REFUND_CONFIRMATIONS_LOADED) return;
+  try {
+    const raw = await fs.readFile(REFUND_CONFIRMATIONS_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && parsed.threads && typeof parsed.threads === "object") {
+      REFUND_CONFIRMATIONS.threads = parsed.threads;
+    }
+  } catch {
+    // no file yet
+  }
+  REFUND_CONFIRMATIONS_LOADED = true;
+}
+
+async function saveRefundConfirmations() {
+  await fs.mkdir(path.dirname(REFUND_CONFIRMATIONS_FILE), { recursive: true });
+  await fs.writeFile(REFUND_CONFIRMATIONS_FILE, JSON.stringify(REFUND_CONFIRMATIONS, null, 2), "utf8");
+}
+
+async function ensureRefundAlertStateLoaded() {
+  if (REFUND_ALERT_STATE_LOADED) return;
+  try {
+    const raw = await fs.readFile(REFUND_ALERT_STATE_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && parsed.alerted && typeof parsed.alerted === "object") {
+      REFUND_ALERT_STATE.alerted = parsed.alerted;
+    }
+  } catch {
+    // no file yet
+  }
+  REFUND_ALERT_STATE_LOADED = true;
+}
+
+async function saveRefundAlertState() {
+  await fs.mkdir(path.dirname(REFUND_ALERT_STATE_FILE), { recursive: true });
+  await fs.writeFile(REFUND_ALERT_STATE_FILE, JSON.stringify(REFUND_ALERT_STATE, null, 2), "utf8");
+}
+
+function looksLikeRefundText(text) {
+  const t = String(text || "").toLowerCase();
+  if (!t) return false;
+  return REFUND_CONFIRM_KEYWORDS.some((kw) => kw && t.includes(kw));
+}
+
+function extractRefundAmountHints(text) {
+  const t = String(text || "");
+  const m = t.match(/(?:\$|usd\s*)(\d{1,6}(?:[.,]\d{1,2})?)/i);
+  if (!m) return "";
+  return `$${m[1].replace(",", ".")}`;
+}
+
+function formatRefundPendingLine(item, idx) {
+  const amount = item.amount_hint ? ` · ${item.amount_hint}` : "";
+  const age = item.age ? ` · age ${item.age}` : "";
+  const customer = item.customer_email ? ` · ${item.customer_email}` : "";
+  const subject = item.subject || "(no subject)";
+  return `${idx + 1}. ${subject}${customer}${amount}${age}\n   thread: ${item.thread_id}`;
+}
+
+async function fetchRefundCandidates(maxItems = REFUND_MAX_PENDING) {
+  const out = await runSupportBrain(["unresolved", "--all", "--max", String(Math.max(20, maxItems)), "--json"], 120000);
+  const parsed = parseJsonObject(out) || {};
+  const threads = Array.isArray(parsed?.threads) ? parsed.threads : [];
+  const items = [];
+  for (const t of threads) {
+    const combined = `${t?.subject || ""}\n${t?.last_snippet || ""}`;
+    if (!looksLikeRefundText(combined)) continue;
+    const threadId = String(t?.thread_id || "").trim();
+    if (!threadId) continue;
+    items.push({
+      thread_id: threadId,
+      customer_email: String(t?.customer_email || "").trim(),
+      subject: String(t?.subject || "").trim(),
+      last_snippet: String(t?.last_snippet || "").trim(),
+      age: String(t?.age || "").trim(),
+      amount_hint: extractRefundAmountHints(combined),
+    });
+  }
+  return items.slice(0, Math.max(1, maxItems));
+}
+
+async function getPendingRefundConfirmations(maxItems = REFUND_MAX_PENDING) {
+  await ensureRefundConfirmationsLoaded();
+  const candidates = await fetchRefundCandidates(maxItems);
+  const pending = [];
+  for (const c of candidates) {
+    const st = REFUND_CONFIRMATIONS.threads[c.thread_id];
+    const status = String(st?.status || "pending");
+    if (status === "approved") continue;
+    pending.push({ ...c, status, note: st?.note || "", confirmed_by: st?.confirmed_by || "" });
+  }
+  return pending;
+}
+
+async function setRefundConfirmation(threadId, status, actor, note = "") {
+  await ensureRefundConfirmationsLoaded();
+  const id = String(threadId || "").trim();
+  if (!id) throw new Error("thread_id is required");
+  REFUND_CONFIRMATIONS.threads[id] = {
+    status,
+    confirmed_by: String(actor || "unknown"),
+    note: String(note || "").trim(),
+    updated_at_ms: Date.now(),
+  };
+  await saveRefundConfirmations();
+}
+
+async function clearRefundConfirmation(threadId) {
+  await ensureRefundConfirmationsLoaded();
+  const id = String(threadId || "").trim();
+  if (!id) throw new Error("thread_id is required");
+  delete REFUND_CONFIRMATIONS.threads[id];
+  await saveRefundConfirmations();
+}
+
+async function resolveRefundAlertChatIds() {
+  if (REFUND_ALERT_CHAT_IDS.length) return REFUND_ALERT_CHAT_IDS;
+  if (ALLOWED_CHAT_IDS.size) return [...ALLOWED_CHAT_IDS.values()];
+  await ensureChatHistoryLoaded();
+  return [...CHAT_HISTORY_BY_CHAT.keys()];
+}
+
+async function runRefundConfirmationCheck(bot, { force = false, targetChatId = "" } = {}) {
+  if (!REFUND_CONFIRMATION_ENABLED) return { sent: 0, total: 0, reason: "disabled" };
+  await ensureRefundAlertStateLoaded();
+  const pending = await getPendingRefundConfirmations(REFUND_MAX_PENDING);
+  if (!pending.length) return { sent: 0, total: 0, reason: "none_pending" };
+
+  const newItems = force
+    ? pending
+    : pending.filter((p) => !REFUND_ALERT_STATE.alerted[p.thread_id]);
+  if (!newItems.length) return { sent: 0, total: pending.length, reason: "already_alerted" };
+
+  const maxLines = Math.min(12, newItems.length);
+  const bodyLines = newItems.slice(0, maxLines).map((p, i) => formatRefundPendingLine(p, i)).join("\n");
+  const msg =
+    `💸 Refund confirmation required (${newItems.length} new / ${pending.length} pending)\n` +
+    `${bodyLines}\n\n` +
+    `Use:\n` +
+    `/refund_confirm <thread_id> [note]\n` +
+    `/refund_reject <thread_id> [note]\n` +
+    `/refunds`;
+
+  const targets = targetChatId ? [String(targetChatId)] : await resolveRefundAlertChatIds();
+  if (!targets.length) return { sent: 0, total: pending.length, reason: "no_target_chats" };
+
+  let sent = 0;
+  for (const cid of targets) {
+    try {
+      await bot.telegram.sendMessage(cid, trimOut(msg), { disable_web_page_preview: true });
+      sent += 1;
+    } catch (e) {
+      console.log(`refund alert send failed chat=${cid}: ${e?.message || String(e)}`);
+    }
+  }
+
+  if (sent > 0) {
+    for (const p of newItems) {
+      REFUND_ALERT_STATE.alerted[p.thread_id] = Date.now();
+    }
+    await saveRefundAlertState();
+  }
+  return { sent, total: pending.length, reason: sent ? "ok" : "send_failed" };
+}
+
+function startRefundConfirmationMonitor(bot) {
+  if (!REFUND_CONFIRMATION_ENABLED) return;
+  const everyMs = Math.max(5, REFUND_ALERT_INTERVAL_MINUTES) * 60 * 1000;
+  const runner = async () => {
+    try {
+      const res = await runRefundConfirmationCheck(bot, { force: false });
+      if (res.reason === "ok") {
+        console.log(`refund confirmation alert: sent=${res.sent} pending=${res.total}`);
+      }
+    } catch (e) {
+      console.log(`refund confirmation monitor error: ${e?.message || String(e)}`);
+    }
+  };
+  const startupTimer = setTimeout(runner, Math.max(0, REFUND_ALERT_STARTUP_DELAY_MS));
   const intervalTimer = setInterval(runner, everyMs);
   if (typeof startupTimer.unref === "function") startupTimer.unref();
   if (typeof intervalTimer.unref === "function") intervalTimer.unref();
@@ -2532,6 +2756,64 @@ async function handleAsanaTaskDoneCommand(ctx, rawText = "") {
   await ctx.reply(trimOut(`✅ Task marked done: ${updated?.name || gid}`));
 }
 
+function actorFromCtx(ctx) {
+  const u = ctx?.from || {};
+  return u.username ? `@${u.username}` : (u.first_name || u.id || "unknown");
+}
+
+async function handleRefundsCommand(ctx) {
+  const pending = await getPendingRefundConfirmations(REFUND_MAX_PENDING);
+  if (!pending.length) {
+    await ctx.reply("✅ No pending refund confirmations right now.");
+    return;
+  }
+  const maxLines = Math.min(20, pending.length);
+  const lines = pending.slice(0, maxLines).map((p, i) => formatRefundPendingLine(p, i)).join("\n");
+  await ctx.reply(
+    trimOut(
+      `💸 Pending refund confirmations: ${pending.length}\n` +
+      `${lines}\n\n` +
+      `Use /refund_confirm <thread_id> [note] or /refund_reject <thread_id> [note]`,
+    ),
+  );
+}
+
+async function handleRefundConfirmCommand(ctx, rawText = "") {
+  const txt = String(rawText || "").trim();
+  const m = txt.match(/^([A-Za-z0-9_-]+)\s*(.*)$/);
+  if (!m) {
+    await ctx.reply("Usage: /refund_confirm <thread_id> [note]");
+    return;
+  }
+  const threadId = m[1];
+  const note = (m[2] || "").trim();
+  await setRefundConfirmation(threadId, "approved", actorFromCtx(ctx), note);
+  await ctx.reply(trimOut(`✅ Refund approved for thread ${threadId}${note ? `\nNote: ${note}` : ""}`));
+}
+
+async function handleRefundRejectCommand(ctx, rawText = "") {
+  const txt = String(rawText || "").trim();
+  const m = txt.match(/^([A-Za-z0-9_-]+)\s*(.*)$/);
+  if (!m) {
+    await ctx.reply("Usage: /refund_reject <thread_id> [note]");
+    return;
+  }
+  const threadId = m[1];
+  const note = (m[2] || "").trim();
+  await setRefundConfirmation(threadId, "rejected", actorFromCtx(ctx), note);
+  await ctx.reply(trimOut(`🛑 Refund rejected for thread ${threadId}${note ? `\nNote: ${note}` : ""}`));
+}
+
+async function handleRefundClearCommand(ctx, rawText = "") {
+  const threadId = String(rawText || "").trim();
+  if (!threadId) {
+    await ctx.reply("Usage: /refund_clear <thread_id>");
+    return;
+  }
+  await clearRefundConfirmation(threadId);
+  await ctx.reply(trimOut(`♻️ Refund confirmation cleared for thread ${threadId}`));
+}
+
 async function runSyncCommandFlow(ctx, refreshCount = 12) {
   await ctx.reply("Running sync_meetings (including transcripts)...");
   let syncText = "";
@@ -2662,6 +2944,10 @@ async function main() {
         "/tasks [current|done|all] — list Asana tasks from General Tasks\n" +
         "/task_add <title> [due:YYYY-MM-DD] — create Asana task\n" +
         "/task_done <task_id> — mark Asana task as completed\n" +
+        "/refunds — list refund confirmations pending approval\n" +
+        "/refund_confirm <thread_id> [note] — approve refund\n" +
+        "/refund_reject <thread_id> [note] — reject refund\n" +
+        "/refund_clear <thread_id> — clear prior confirmation state\n" +
         "/overdue_check [all] — run overdue check for To Do/Doing now\n" +
         "/transcript <title> — get meeting transcript\n" +
         "/ask <question> — ask in groups (works even with privacy mode)\n" +
@@ -2739,6 +3025,49 @@ async function main() {
       await handleAsanaTaskDoneCommand(ctx, txt.replace(/^\/task_done(?:@\w+)?\s*/i, ""));
     } catch (e) {
       await ctx.reply(`Asana complete error: ${e?.message || String(e)}`);
+    }
+  });
+
+  bot.command("refunds", async (ctx) => {
+    ctx.state.handledCommand = true;
+    if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
+    try {
+      await handleRefundsCommand(ctx);
+    } catch (e) {
+      await ctx.reply(`Refunds error: ${e?.message || String(e)}`);
+    }
+  });
+
+  bot.command("refund_confirm", async (ctx) => {
+    ctx.state.handledCommand = true;
+    if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
+    const txt = (ctx.message?.text || "").trim();
+    try {
+      await handleRefundConfirmCommand(ctx, txt.replace(/^\/refund_confirm(?:@\w+)?\s*/i, ""));
+    } catch (e) {
+      await ctx.reply(`Refund confirm error: ${e?.message || String(e)}`);
+    }
+  });
+
+  bot.command("refund_reject", async (ctx) => {
+    ctx.state.handledCommand = true;
+    if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
+    const txt = (ctx.message?.text || "").trim();
+    try {
+      await handleRefundRejectCommand(ctx, txt.replace(/^\/refund_reject(?:@\w+)?\s*/i, ""));
+    } catch (e) {
+      await ctx.reply(`Refund reject error: ${e?.message || String(e)}`);
+    }
+  });
+
+  bot.command("refund_clear", async (ctx) => {
+    ctx.state.handledCommand = true;
+    if (!isAllowedChat(ctx)) return ctx.reply("Access is not allowed in this chat.");
+    const txt = (ctx.message?.text || "").trim();
+    try {
+      await handleRefundClearCommand(ctx, txt.replace(/^\/refund_clear(?:@\w+)?\s*/i, ""));
+    } catch (e) {
+      await ctx.reply(`Refund clear error: ${e?.message || String(e)}`);
     }
   });
 
@@ -2820,6 +3149,10 @@ async function main() {
             "/tasks [current|done|all] — list Asana tasks from General Tasks\n" +
             "/task_add <title> [due:YYYY-MM-DD] — create Asana task\n" +
             "/task_done <task_id> — mark Asana task as completed\n" +
+            "/refunds — list refund confirmations pending approval\n" +
+            "/refund_confirm <thread_id> [note] — approve refund\n" +
+            "/refund_reject <thread_id> [note] — reject refund\n" +
+            "/refund_clear <thread_id> — clear prior confirmation state\n" +
             "/overdue_check [all] — run overdue check for To Do/Doing now\n" +
             "/transcript <title> — get meeting transcript\n" +
             "/ask <question> — ask in groups (works even with privacy mode)\n" +
@@ -2886,6 +3219,42 @@ async function main() {
           await handleAsanaTaskDoneCommand(ctx, txt.replace(/^\/task_done(?:@\w+)?\s*/i, ""));
         } catch (e) {
           await ctx.reply(`Asana complete error: ${e?.message || String(e)}`);
+        }
+        return;
+      }
+
+      if (/^\/refunds(?:@\w+)?(?:\s|$)/i.test(lower)) {
+        try {
+          await handleRefundsCommand(ctx);
+        } catch (e) {
+          await ctx.reply(`Refunds error: ${e?.message || String(e)}`);
+        }
+        return;
+      }
+
+      if (/^\/refund_confirm(?:@\w+)?(?:\s|$)/i.test(lower)) {
+        try {
+          await handleRefundConfirmCommand(ctx, txt.replace(/^\/refund_confirm(?:@\w+)?\s*/i, ""));
+        } catch (e) {
+          await ctx.reply(`Refund confirm error: ${e?.message || String(e)}`);
+        }
+        return;
+      }
+
+      if (/^\/refund_reject(?:@\w+)?(?:\s|$)/i.test(lower)) {
+        try {
+          await handleRefundRejectCommand(ctx, txt.replace(/^\/refund_reject(?:@\w+)?\s*/i, ""));
+        } catch (e) {
+          await ctx.reply(`Refund reject error: ${e?.message || String(e)}`);
+        }
+        return;
+      }
+
+      if (/^\/refund_clear(?:@\w+)?(?:\s|$)/i.test(lower)) {
+        try {
+          await handleRefundClearCommand(ctx, txt.replace(/^\/refund_clear(?:@\w+)?\s*/i, ""));
+        } catch (e) {
+          await ctx.reply(`Refund clear error: ${e?.message || String(e)}`);
         }
         return;
       }
@@ -2971,6 +3340,7 @@ async function main() {
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
 
   startAsanaOverdueMonitor(bot);
+  startRefundConfirmationMonitor(bot);
   await bot.launch({ dropPendingUpdates: true });
   console.log("wagner-fellow-bot started");
 }
