@@ -71,6 +71,12 @@ const DEBUG_CHAT_TITLES = (process.env.DEBUG_CHAT_TITLES || "tech notifs")
   .split(",")
   .map((x) => x.trim().toLowerCase())
   .filter(Boolean);
+const WORKING_CHAT_NOTIFICATIONS_ENABLED = (process.env.WORKING_CHAT_NOTIFICATIONS_ENABLED || "1") === "1";
+const ALLOW_TECH_NOTIFICATIONS_IN_WORKING_CHAT = (process.env.ALLOW_TECH_NOTIFICATIONS_IN_WORKING_CHAT || "0") === "1";
+const COMPLETION_CHECK_INTERVAL_SECONDS = Math.max(
+  15,
+  parseInt(process.env.COMPLETION_CHECK_INTERVAL_SECONDS || "45", 10),
+);
 
 const STATE_FILE = process.env.STATE_FILE || path.resolve(process.cwd(), "inch-task-state.json");
 const MAX_PROCESSED_KEYS = Math.max(1000, parseInt(process.env.MAX_PROCESSED_KEYS || "20000", 10));
@@ -79,6 +85,7 @@ const state = {
   processed: {},
   working_chat_ids: [],
   debug_chat_ids: [],
+  tasks_meta: {},
   created_at: Date.now(),
   updated_at: Date.now(),
 };
@@ -88,6 +95,7 @@ let asanaWorkspaceCache = ASANA_WORKSPACE_GID;
 let asanaProjectCache = ASANA_PROJECT_GID;
 let asanaUsersCache = null;
 let nextUpdateOffset = 0;
+let completionCheckRunning = false;
 
 function parseKvMap(raw) {
   const map = new Map();
@@ -149,9 +157,17 @@ function isWorkingChat(chat) {
   return WORKING_CHAT_TITLES.some((t) => t && title.includes(t));
 }
 
+function getWorkingChatIds() {
+  const merged = new Set([...WORKING_CHAT_IDS, ...state.working_chat_ids]);
+  return [...merged].filter(Boolean);
+}
+
 function getDebugChatIds() {
   const merged = new Set([...DEBUG_CHAT_IDS, ...state.debug_chat_ids]);
-  return [...merged].filter(Boolean);
+  const all = [...merged].filter(Boolean);
+  if (ALLOW_TECH_NOTIFICATIONS_IN_WORKING_CHAT) return all;
+  const working = new Set(getWorkingChatIds());
+  return all.filter((id) => !working.has(String(id)));
 }
 
 function discoverChatsFromMessage(msg, text) {
@@ -181,6 +197,7 @@ async function loadState() {
       if (parsed.processed && typeof parsed.processed === "object") state.processed = parsed.processed;
       if (Array.isArray(parsed.working_chat_ids)) state.working_chat_ids = parsed.working_chat_ids.map(String);
       if (Array.isArray(parsed.debug_chat_ids)) state.debug_chat_ids = parsed.debug_chat_ids.map(String);
+      if (parsed.tasks_meta && typeof parsed.tasks_meta === "object") state.tasks_meta = parsed.tasks_meta;
       state.created_at = Number(parsed.created_at || state.created_at);
       state.updated_at = Date.now();
     }
@@ -247,6 +264,12 @@ async function notifyDebug(text) {
   }
 }
 
+async function notifyWorking(chatId, text) {
+  if (!WORKING_CHAT_NOTIFICATIONS_ENABLED) return;
+  if (!chatId) return;
+  await tgSend(chatId, text);
+}
+
 function extractMentions(msg, text) {
   const out = new Set();
   const entities = Array.isArray(msg?.entities) ? msg.entities : [];
@@ -268,6 +291,16 @@ function extractMentions(msg, text) {
     if (u) out.add(u);
   }
   return out;
+}
+
+function compactMessageSummary(text) {
+  return clipText(
+    String(text || "")
+      .replace(/@[A-Za-z0-9_]{4,32}/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+    140,
+  );
 }
 
 function buildTaskTitle(targetUsername, senderUsername, text) {
@@ -415,14 +448,96 @@ async function createAsanaTask({ projectGid, title, notes, assigneeGid }) {
   return created;
 }
 
+async function getAsanaTask(taskGid) {
+  if (!taskGid) return null;
+  const fields = "gid,name,notes,completed,completed_at,assignee.name,permalink_url";
+  return asanaRequest("GET", `/tasks/${encodeURIComponent(taskGid)}?opt_fields=${encodeURIComponent(fields)}`);
+}
+
+function parseSenderUsernameFromNotes(notes) {
+  const m = String(notes || "").match(/^\s*Sender:\s*@?([A-Za-z0-9_]{4,32})\s*$/mi);
+  return m ? normalizeUsername(m[1]) : "";
+}
+
+function resolveRequesterMention(record, task) {
+  const fromRecord = normalizeUsername(record?.requester_username || "");
+  if (fromRecord) return `@${fromRecord}`;
+  const fromNotes = parseSenderUsernameFromNotes(task?.notes || "");
+  if (fromNotes) return `@${fromNotes}`;
+  const fallback = String(record?.requester_name || "").trim();
+  return fallback || "the requester";
+}
+
+async function runCompletionFollowupCheck() {
+  if (completionCheckRunning) return;
+  if (!ASANA_ENABLED) return;
+  completionCheckRunning = true;
+  let changed = false;
+  try {
+    const pending = Object.entries(state.processed).filter(([, rec]) => (
+      rec
+      && rec.status === "created"
+      && rec.task_gid
+      && !rec.followup_sent_at
+    ));
+    if (!pending.length) return;
+
+    for (const [key, rec] of pending) {
+      try {
+        const task = await getAsanaTask(rec.task_gid);
+        if (!task?.completed) continue;
+        const chatId = String(rec.source_chat_id || key.split(":")[0] || "");
+        if (!chatId) {
+          rec.followup_sent_at = Date.now();
+          changed = true;
+          continue;
+        }
+
+        const requester = resolveRequesterMention(rec, task);
+        const owner = rec.target_username ? `@${rec.target_username}` : "assignee";
+        const taskTitle = clipText(task?.name || rec.task_name || "Task", 120);
+        const taskLink = String(task?.permalink_url || rec.task_permalink_url || "").trim();
+        const followupText =
+          `✅ Task completed\n` +
+          `${requester}, your request is marked done by ${owner}.\n` +
+          `Task: ${taskTitle}` +
+          (taskLink ? `\n${taskLink}` : "");
+        await notifyWorking(chatId, followupText);
+
+        rec.followup_sent_at = Date.now();
+        rec.followup_task_completed_at = String(task?.completed_at || "");
+        changed = true;
+      } catch (err) {
+        await notifyDebug(`completion-check warning task=${rec?.task_gid || "?"}: ${err?.message || String(err)}`);
+      }
+    }
+  } finally {
+    completionCheckRunning = false;
+    if (changed) await saveState();
+  }
+}
+
+function startCompletionFollowupMonitor() {
+  const everyMs = COMPLETION_CHECK_INTERVAL_SECONDS * 1000;
+  const runner = () => {
+    runCompletionFollowupCheck().catch((err) => {
+      notifyDebug(`completion monitor error: ${err?.message || String(err)}`).catch(() => {});
+    });
+  };
+  const interval = setInterval(runner, everyMs);
+  const startup = setTimeout(runner, 5000);
+  if (typeof interval.unref === "function") interval.unref();
+  if (typeof startup.unref === "function") startup.unref();
+}
+
 async function handleStatusCommand(msg) {
   const chatId = String(msg?.chat?.id || "");
   const text =
     `inch_task_bot status\n` +
     `asana: ${ASANA_ENABLED ? "enabled" : "disabled"}\n` +
     `tracked users: ${[...TRACKED_USERS].map((u) => `@${u}`).join(", ")}\n` +
-    `working chats: ${[...new Set([...WORKING_CHAT_IDS, ...state.working_chat_ids])].join(", ") || "(none)"}\n` +
-    `debug chats: ${getDebugChatIds().join(", ") || "(none)"}`;
+    `working chats: ${getWorkingChatIds().join(", ") || "(none)"}\n` +
+    `debug chats (tech): ${getDebugChatIds().join(", ") || "(none)"}`;
   await tgSend(chatId, text);
 }
 
@@ -492,10 +607,18 @@ async function processMessage(msg) {
         ts: Date.now(),
         status: "duplicate",
         task_gid: String(duplicate.gid),
+        source_chat_id: chatId,
+        source_message_id: Number(msg.message_id || 0),
+        target_username: target,
+        requester_username: senderUsername,
+        requester_name: `${msg.from?.first_name || ""} ${msg.from?.last_name || ""}`.trim(),
       };
-      await notifyDebug(
-        `ℹ️ duplicate skipped\nchat=${chatId}\nmsg=${msg.message_id}\ntarget=@${target}\nexisting_task=${duplicate.gid}`,
-      );
+      const duplicateText =
+        `ℹ️ Similar task already exists for @${target}.\n` +
+        `I skipped creating a duplicate.` +
+        (duplicate?.permalink_url ? `\n${duplicate.permalink_url}` : "");
+      await notifyWorking(chatId, duplicateText);
+      await notifyDebug(`duplicate skipped chat=${chatId} msg=${msg.message_id} target=@${target} existing_task=${duplicate.gid}`);
       continue;
     }
 
@@ -521,13 +644,23 @@ async function processMessage(msg) {
       ts: Date.now(),
       status: "created",
       task_gid: String(created?.gid || ""),
+      source_chat_id: chatId,
+      source_message_id: Number(msg.message_id || 0),
+      target_username: target,
+      requester_username: senderUsername,
+      requester_name: `${msg.from?.first_name || ""} ${msg.from?.last_name || ""}`.trim(),
+      task_name: String(created?.name || title || ""),
+      task_permalink_url: String(created?.permalink_url || ""),
     };
 
-    await notifyDebug(
-      `✅ task created\nchat=${chatId}\nmsg=${msg.message_id}\ntarget=@${target}\n` +
-        `task=${created?.gid || "(unknown)"}\n` +
-        `${created?.permalink_url || ""}`,
-    );
+    const friendly =
+      `✅ Task captured in Asana\n` +
+      `Owner: @${target}\n` +
+      `Requested by: ${senderLine || "unknown"}\n` +
+      `Request: ${compactMessageSummary(text)}\n` +
+      (created?.permalink_url ? `${created.permalink_url}` : "");
+    await notifyWorking(chatId, friendly);
+    await notifyDebug(`task created chat=${chatId} msg=${msg.message_id} target=@${target} task=${created?.gid || "(unknown)"}`);
   }
 
   await saveState();
@@ -571,6 +704,7 @@ async function main() {
   const me = await tgApi("getMe");
   console.log(`inch_task_bot started as @${me?.username || BOT_USERNAME}`);
   await notifyDebug(`🤖 inch_task_bot started as @${me?.username || BOT_USERNAME}`);
+  startCompletionFollowupMonitor();
   await pollLoop();
 }
 
