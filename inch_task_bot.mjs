@@ -679,9 +679,6 @@ async function processMessage(msg) {
   const text = String(msg.text || msg.caption || "").trim();
   if (!text) return;
 
-  discoverChatsFromMessage(msg, text);
-  if (await handleManualChatCommands(msg, text)) return;
-
   const chat = msg.chat || {};
   const chatId = String(chat.id || "");
   recordEvent("incoming_message", {
@@ -689,6 +686,12 @@ async function processMessage(msg) {
     message_id: Number(msg.message_id || 0),
     text_preview: clipText(text, 80),
   });
+
+  discoverChatsFromMessage(msg, text);
+  if (await handleManualChatCommands(msg, text)) {
+    await saveState();
+    return;
+  }
   if (!isWorkingChat(chat)) return;
 
   const mentions = extractMentions(msg, text);
@@ -702,6 +705,7 @@ async function processMessage(msg) {
       sender: senderUsername || "",
       mentions: [...mentions],
     });
+    await saveState();
     return;
   }
 
