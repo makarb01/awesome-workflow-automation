@@ -590,12 +590,10 @@ async function runCompletionFollowupCheck() {
         const requester = resolveRequesterMention(rec, task);
         const owner = rec.target_username ? `@${rec.target_username}` : "assignee";
         const taskTitle = clipText(task?.name || rec.task_name || "Task", 120);
-        const taskLink = String(task?.permalink_url || rec.task_permalink_url || "").trim();
         const followupText =
           `✅ Task completed\n` +
           `${requester}, your request is marked done by ${owner}.\n` +
-          `Task: ${taskTitle}` +
-          (taskLink ? `\n${taskLink}` : "");
+          `Task: ${taskTitle}`;
         await notifyWorking(chatId, followupText);
 
         rec.followup_sent_at = Date.now();
@@ -739,8 +737,7 @@ async function processMessage(msg) {
       };
       const duplicateText =
         `ℹ️ Similar task already exists for @${target}.\n` +
-        `I skipped creating a duplicate.` +
-        (duplicate?.permalink_url ? `\n${duplicate.permalink_url}` : "");
+        `I skipped creating a duplicate.`;
       await notifyWorking(chatId, duplicateText);
       await notifyDebug(`duplicate skipped chat=${chatId} msg=${msg.message_id} target=@${target} existing_task=${duplicate.gid}`);
       recordEvent("duplicate_task", {
@@ -787,8 +784,7 @@ async function processMessage(msg) {
       `✅ Task captured in Asana\n` +
       `Owner: @${target}\n` +
       `Requested by: ${senderLine || "unknown"}\n` +
-      `Request: ${compactMessageSummary(text)}\n` +
-      (created?.permalink_url ? `${created.permalink_url}` : "");
+      `Request: ${compactMessageSummary(text)}`;
     await notifyWorking(chatId, friendly);
     await notifyDebug(`task created chat=${chatId} msg=${msg.message_id} target=@${target} task=${created?.gid || "(unknown)"}`);
     recordEvent("task_created", {
