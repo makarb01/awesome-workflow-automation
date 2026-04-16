@@ -31,23 +31,27 @@ const TG_RETRY_MS = Math.max(500, parseInt(process.env.TG_RETRY_MS || "1500", 10
 const ASANA_ACCESS_TOKEN = process.env.ASANA_ACCESS_TOKEN || "";
 const ASANA_API_BASE = process.env.ASANA_API_BASE || "https://app.asana.com/api/1.0";
 const ASANA_PROJECT_GID = (process.env.ASANA_PROJECT_GID || "").trim();
-const ASANA_POLL_INTERVAL_SEC = Math.max(20, parseInt(process.env.ASANA_POLL_INTERVAL_SEC || "90", 10));
+const ASANA_POLL_INTERVAL_SEC = Math.max(
+  20,
+  parseInt(process.env.ASANA_POLL_INTERVAL_SEC || process.env.ASANA_POLL_INTERVAL_SECONDS || process.env.POLL_INTERVAL_SECONDS || "90", 10),
+);
 const ASANA_COMPLETED_LOOKBACK_DAYS = Math.max(1, parseInt(process.env.ASANA_COMPLETED_LOOKBACK_DAYS || "180", 10));
-const ASANA_FETCH_LIMIT = Math.max(1, Math.min(100, parseInt(process.env.ASANA_FETCH_LIMIT || "100", 10)));
+const ASANA_FETCH_LIMIT = Math.max(1, Math.min(100, parseInt(process.env.ASANA_FETCH_LIMIT || process.env.MAX_TASKS || "100", 10)));
 const MAX_EVENTS_PER_POLL = Math.max(1, Math.min(100, parseInt(process.env.MAX_EVENTS_PER_POLL || "20", 10)));
+const ASSIGNEE_TELEGRAM_MAP_RAW = process.env.ASSIGNEE_TELEGRAM_MAP || process.env.ASANA_TELEGRAM_MAP || "";
 
 const NOTIFY_CHAT_IDS = new Set(
-  (process.env.NOTIFY_CHAT_IDS || "")
+  (process.env.NOTIFY_CHAT_IDS || process.env.TARGET_CHAT_IDS || "")
     .split(",")
     .map((x) => x.trim())
     .filter(Boolean),
 );
-const NOTIFY_CHAT_TITLES = (process.env.NOTIFY_CHAT_TITLES || "Digital Nudge - Finance")
+const NOTIFY_CHAT_TITLES = (process.env.NOTIFY_CHAT_TITLES || process.env.TARGET_CHAT_TITLES || "Digital Nudge - Finance")
   .split(",")
   .map((x) => x.trim().toLowerCase())
   .filter(Boolean);
 
-const STATE_FILE = process.env.STATE_FILE || path.resolve(process.cwd(), "inch-asana-notificaitons-state.json");
+const STATE_FILE = process.env.STATE_FILE || path.resolve(process.cwd(), "inch-asana-notifications-state.json");
 const MAX_TASKS_IN_STATE = Math.max(1000, parseInt(process.env.MAX_TASKS_IN_STATE || "20000", 10));
 
 const state = {
@@ -62,9 +66,34 @@ const state = {
 let nextUpdateOffset = 0;
 let saveQueue = Promise.resolve();
 let lastErrorNotifyTs = 0;
+const assigneeTelegramMap = parseKvMap(ASSIGNEE_TELEGRAM_MAP_RAW);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseKvMap(raw) {
+  const map = new Map();
+  for (const part of String(raw || "").split(",")) {
+    const item = part.trim();
+    if (!item) continue;
+    const eq = item.indexOf("=");
+    if (eq <= 0) continue;
+    const key = item.slice(0, eq).trim().toLowerCase();
+    const value = item.slice(eq + 1).trim();
+    if (key && value) map.set(key, value);
+  }
+  return map;
+}
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function toTelegramHandle(value) {
+  const v = String(value || "").trim();
+  if (!v) return "";
+  return v.startsWith("@") ? v : `@${v}`;
 }
 
 function clipText(text, maxLen = 3500) {
@@ -100,6 +129,21 @@ function taskStatusLabel(task) {
   return task.section_name || "No section";
 }
 
+function resolveAssigneePing(task) {
+  const mapped = assigneeTelegramMap.get(normalizeEmail(task?.assignee_email));
+  return mapped ? toTelegramHandle(mapped) : "";
+}
+
+function assigneeLabel(task) {
+  const ping = resolveAssigneePing(task);
+  if (ping) return ping;
+  const byName = String(task?.assignee_name || "").trim();
+  if (byName) return byName;
+  const byEmail = String(task?.assignee_email || "").trim();
+  if (byEmail) return byEmail;
+  return "Unassigned";
+}
+
 function findMembershipForProject(task) {
   const memberships = Array.isArray(task?.memberships) ? task.memberships : [];
   return memberships.find((m) => String(m?.project?.gid || "") === ASANA_PROJECT_GID) || memberships[0] || null;
@@ -115,7 +159,9 @@ function shapeTask(task) {
     completed: Boolean(task?.completed),
     section_gid: sectionGid,
     section_name: sectionName,
+    assignee_gid: String(task?.assignee?.gid || ""),
     assignee_name: String(task?.assignee?.name || ""),
+    assignee_email: String(task?.assignee?.email || ""),
     permalink_url: String(task?.permalink_url || ""),
     created_at: String(task?.created_at || ""),
     modified_at: String(task?.modified_at || ""),
@@ -231,7 +277,7 @@ async function handleCommandsFromMessage(msg) {
   const txt = normalizeCommandText(rawText);
   const lower = txt.toLowerCase();
 
-  if (/^\/set_notify_chat(?:@\w+)?(?:\s|$)/.test(lower)) {
+  if (/^\/set_(?:notify|notifications)_chat(?:@\w+)?(?:\s|$)/.test(lower)) {
     if (!state.notify_chat_ids.includes(chatId)) state.notify_chat_ids.push(chatId);
     await saveState();
     await tgSend(chatId, "✅ This chat is now configured for Asana notifications.");
@@ -243,6 +289,7 @@ async function handleCommandsFromMessage(msg) {
       `inch_asana_notificaitons_bot status\n` +
       `project_gid: ${ASANA_PROJECT_GID}\n` +
       `notify_chats: ${getNotifyChatIds().join(", ") || "(none)"}\n` +
+      `assignee_telegram_map: ${assigneeTelegramMap.size}\n` +
       `initialized: ${state.initialized ? "yes" : "no"}\n` +
       `tracked_tasks: ${Object.keys(state.tasks).length}\n` +
       `last_sync_at: ${state.last_sync_at ? new Date(state.last_sync_at).toISOString() : "(never)"}`;
@@ -294,6 +341,7 @@ async function fetchProjectTasksSnapshot() {
     "permalink_url",
     "assignee.gid",
     "assignee.name",
+    "assignee.email",
     "memberships.project.gid",
     "memberships.section.gid",
     "memberships.section.name",
@@ -340,8 +388,13 @@ function compareSnapshots(prevMap, currMap) {
     }
     const sectionChanged = String(prev.section_gid || "") !== String(curr.section_gid || "");
     const completionChanged = Boolean(prev.completed) !== Boolean(curr.completed);
+    const assigneeChanged = String(prev.assignee_gid || "") !== String(curr.assignee_gid || "");
     if (sectionChanged || completionChanged) {
       events.push({ type: "status", prev, curr });
+      continue;
+    }
+    if (assigneeChanged) {
+      events.push({ type: "assignee", prev, curr });
     }
   }
   return events;
@@ -354,7 +407,7 @@ function formatEvent(event) {
       `🆕 New task\n` +
       `${t.name}\n` +
       `Status: ${taskStatusLabel(t)}\n` +
-      `Assignee: ${t.assignee_name || "Unassigned"}\n` +
+      `Assignee: ${assigneeLabel(t)}\n` +
       `${t.permalink_url || ""}`
     );
   }
@@ -365,7 +418,17 @@ function formatEvent(event) {
       `🔁 Status changed\n` +
       `${event.curr.name}\n` +
       `${prevLabel} -> ${currLabel}\n` +
-      `Assignee: ${event.curr.assignee_name || "Unassigned"}\n` +
+      `Assignee: ${assigneeLabel(event.curr)}\n` +
+      `${event.curr.permalink_url || ""}`
+    );
+  }
+  if (event.type === "assignee") {
+    const prevAssignee = assigneeLabel(event.prev);
+    const currAssignee = assigneeLabel(event.curr);
+    return (
+      `👤 Assignee changed\n` +
+      `${event.curr.name}\n` +
+      `${prevAssignee} -> ${currAssignee}\n` +
       `${event.curr.permalink_url || ""}`
     );
   }
