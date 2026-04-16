@@ -429,17 +429,21 @@ async function handleStatusCommand(msg) {
 async function handleManualChatCommands(msg, text) {
   const chatId = String(msg?.chat?.id || "");
   const cmd = String(text || "").trim().toLowerCase();
-  if (/^\/status(?:@\w+)?(?:\s|$)/.test(cmd)) {
+  const statusCmd = /(?:^|\s)\/status(?:@\w+)?(?:\s|$)/.test(cmd);
+  const workingCmd = /(?:^|\s)\/set_working_chat(?:@\w+)?(?:\s|$)/.test(cmd);
+  const debugCmd = /(?:^|\s)\/set_debug_chat(?:@\w+)?(?:\s|$)/.test(cmd);
+
+  if (statusCmd) {
     await handleStatusCommand(msg);
     return true;
   }
-  if (/^\/set_working_chat(?:@\w+)?(?:\s|$)/.test(cmd)) {
+  if (workingCmd) {
     if (!state.working_chat_ids.includes(chatId)) state.working_chat_ids.push(chatId);
     await saveState();
     await tgSend(chatId, "✅ This chat was added as working chat.");
     return true;
   }
-  if (/^\/set_debug_chat(?:@\w+)?(?:\s|$)/.test(cmd)) {
+  if (debugCmd) {
     if (!state.debug_chat_ids.includes(chatId)) state.debug_chat_ids.push(chatId);
     await saveState();
     await tgSend(chatId, "✅ This chat was added as debug notifications chat.");
