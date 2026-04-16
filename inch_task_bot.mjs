@@ -395,6 +395,43 @@ function compactMessageSummary(text) {
   );
 }
 
+function extractMessageText(msg) {
+  return String(msg?.text || msg?.caption || "").trim();
+}
+
+function isLikelyFollowupText(text) {
+  const normalized = normalizeText(text);
+  if (!normalized) return true;
+  const words = normalized.split(" ").filter(Boolean);
+  if (words.length > 12) return false;
+  const followupHints = [
+    "follow up",
+    "following up",
+    "just following up",
+    "reminder",
+    "any update",
+    "update",
+    "ping",
+    "nudge",
+    "status",
+    "check this one",
+    "this one",
+    "same one",
+  ];
+  return followupHints.some((h) => normalized.includes(h));
+}
+
+function mergeRequestWithReplyContext(text, replyText) {
+  const mainText = String(text || "").trim();
+  const parentText = String(replyText || "").trim();
+  if (!parentText) return mainText;
+  const mainWords = normalizeText(mainText).split(" ").filter(Boolean);
+  const shortGeneric = mainWords.length <= 8;
+  if (!isLikelyFollowupText(mainText) && !shortGeneric) return mainText;
+  if (!mainText) return clipText(parentText, 1800);
+  return clipText(`${mainText}\n\nContext from replied message:\n${parentText}`, 1800);
+}
+
 function buildTaskTitle(targetUsername, senderUsername, text) {
   const clean = String(text || "")
     .replace(/@[A-Za-z0-9_]{4,32}/g, " ")
@@ -674,8 +711,10 @@ async function handleManualChatCommands(msg, text) {
 
 async function processMessage(msg) {
   if (!msg || msg.from?.is_bot) return;
-  const text = String(msg.text || msg.caption || "").trim();
+  const text = extractMessageText(msg);
   if (!text) return;
+  const replyText = extractMessageText(msg.reply_to_message || null);
+  const effectiveText = mergeRequestWithReplyContext(text, replyText);
 
   const chat = msg.chat || {};
   const chatId = String(chat.id || "");
@@ -683,6 +722,7 @@ async function processMessage(msg) {
     chat_id: chatId,
     message_id: Number(msg.message_id || 0),
     text_preview: clipText(text, 80),
+    with_reply_context: effectiveText !== text,
   });
 
   discoverChatsFromMessage(msg, text);
@@ -692,10 +732,18 @@ async function processMessage(msg) {
   }
   if (!isWorkingChat(chat)) return;
 
-  const mentions = extractMentions(msg, text);
+  const mentions = new Set([
+    ...extractMentions(msg, text),
+    ...extractMentions(msg.reply_to_message || {}, replyText),
+  ]);
   const botMentioned = mentions.has(BOT_USERNAME);
   const senderUsername = normalizeUsername(msg.from?.username || "");
-  const targets = chooseTargets({ mentions, senderUsername, botMentioned, text });
+  const targets = chooseTargets({
+    mentions,
+    senderUsername,
+    botMentioned,
+    text: `${text}\n${replyText}`.trim() || effectiveText,
+  });
   if (!targets.length) {
     recordEvent("skip_no_targets", {
       chat_id: chatId,
@@ -720,7 +768,7 @@ async function processMessage(msg) {
     if (state.processed[processedKey]) continue;
 
     const sourceMarker = `[tg-source:${processedKey}]`;
-    const title = buildTaskTitle(target, senderUsername, text);
+    const title = buildTaskTitle(target, senderUsername, effectiveText);
     const assigneeGid = await resolveAssigneeGid(target);
     const duplicate = findDuplicateTask(openTasks, sourceMarker, title, assigneeGid);
 
@@ -757,7 +805,10 @@ async function processMessage(msg) {
       `Sender: ${senderLine || "(unknown)"}\n` +
       `Target: @${target}\n` +
       (messageLink ? `Message link: ${messageLink}\n` : "") +
-      `\nMessage text:\n${text}`;
+      `\nMessage text:\n${effectiveText}` +
+      (effectiveText !== text
+        ? `\n\nFollow-up message:\n${text}\n\nReplied-to message:\n${replyText}`
+        : "");
 
     const created = await createAsanaTask({
       projectGid,
@@ -784,7 +835,7 @@ async function processMessage(msg) {
       `✅ Task captured in Asana\n` +
       `Owner: @${target}\n` +
       `Requested by: ${senderLine || "unknown"}\n` +
-      `Request: ${compactMessageSummary(text)}`;
+      `Request: ${compactMessageSummary(effectiveText)}`;
     await notifyWorking(chatId, friendly);
     await notifyDebug(`task created chat=${chatId} msg=${msg.message_id} target=@${target} task=${created?.gid || "(unknown)"}`);
     recordEvent("task_created", {
