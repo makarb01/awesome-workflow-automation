@@ -829,7 +829,10 @@ async function pollLoop() {
         await processUpdate(upd);
       }
     } catch (err) {
-      console.log(`poll error: ${err?.message || String(err)}`);
+      const emsg = err?.message || String(err);
+      console.log(`poll error: ${emsg}`);
+      recordEvent("poll_error", { error: String(emsg) });
+      await saveState();
       await new Promise((resolve) => setTimeout(resolve, TG_RETRY_MS));
     }
   }
@@ -840,6 +843,8 @@ async function main() {
   await loadState();
   const me = await tgApi("getMe");
   console.log(`inch_task_bot started as @${me?.username || BOT_USERNAME}`);
+  recordEvent("startup", { bot_username: me?.username || BOT_USERNAME });
+  await saveState();
   await notifyDebug(`🤖 inch_task_bot started as @${me?.username || BOT_USERNAME}`);
   startCompletionFollowupMonitor();
   await pollLoop();
