@@ -45,6 +45,9 @@ const TRACKED_USERS = new Set(
     .map((x) => x.trim().replace(/^@/, "").toLowerCase())
     .filter(Boolean),
 );
+const TRACKED_ALIASES_RAW =
+  process.env.TRACKED_ALIASES ||
+  "makar=makarbizyukin,dasha=dshwwxzz,yaroslav=yaroslavandreev00,mitali=mitali_1515";
 
 const TG_ASANA_MAP_RAW =
   process.env.TG_ASANA_MAP ||
@@ -86,11 +89,13 @@ const state = {
   working_chat_ids: [],
   debug_chat_ids: [],
   tasks_meta: {},
+  last_events: [],
   created_at: Date.now(),
   updated_at: Date.now(),
 };
 
 const tgAsanaMap = parseKvMap(TG_ASANA_MAP_RAW);
+const trackedAliasesMap = parseKvMap(TRACKED_ALIASES_RAW);
 let asanaWorkspaceCache = ASANA_WORKSPACE_GID;
 let asanaProjectCache = ASANA_PROJECT_GID;
 let asanaUsersCache = null;
@@ -198,6 +203,7 @@ async function loadState() {
       if (Array.isArray(parsed.working_chat_ids)) state.working_chat_ids = parsed.working_chat_ids.map(String);
       if (Array.isArray(parsed.debug_chat_ids)) state.debug_chat_ids = parsed.debug_chat_ids.map(String);
       if (parsed.tasks_meta && typeof parsed.tasks_meta === "object") state.tasks_meta = parsed.tasks_meta;
+      if (Array.isArray(parsed.last_events)) state.last_events = parsed.last_events;
       state.created_at = Number(parsed.created_at || state.created_at);
       state.updated_at = Date.now();
     }
@@ -221,6 +227,20 @@ function pruneProcessedKeys() {
     .sort((a, b) => Number(state.processed[a]?.ts || 0) - Number(state.processed[b]?.ts || 0))
     .slice(0, keys.length - MAX_PROCESSED_KEYS)
     .forEach((k) => delete state.processed[k]);
+}
+
+function recordEvent(type, details = {}) {
+  const ev = {
+    ts: Date.now(),
+    type: String(type || "unknown"),
+    ...details,
+  };
+  state.last_events.push(ev);
+  if (state.last_events.length > 200) {
+    state.last_events = state.last_events.slice(state.last_events.length - 200);
+  }
+  const short = JSON.stringify(ev);
+  console.log(`event ${short}`);
 }
 
 function ensureConfig() {
@@ -281,9 +301,17 @@ function extractMentions(msg, text) {
       const u = normalizeUsername(chunk);
       if (u) out.add(u);
     }
-    if (entity.type === "text_mention" && entity.user?.username) {
-      const u = normalizeUsername(entity.user.username);
-      if (u) out.add(u);
+    if (entity.type === "text_mention") {
+      if (entity.user?.username) {
+        const u = normalizeUsername(entity.user.username);
+        if (u) out.add(u);
+      } else {
+        const chunk = raw.slice(entity.offset, entity.offset + entity.length).trim().toLowerCase();
+        if (chunk) {
+          const mapped = trackedAliasesMap.get(chunk);
+          if (mapped) out.add(normalizeUsername(mapped));
+        }
+      }
     }
   }
   for (const match of raw.matchAll(/(^|\s)@([A-Za-z0-9_]{4,32})/g)) {
@@ -291,6 +319,31 @@ function extractMentions(msg, text) {
     if (u) out.add(u);
   }
   return out;
+}
+
+function inferTargetsFromText(text) {
+  const lower = String(text || "").toLowerCase();
+  const targets = new Set();
+  for (const user of TRACKED_USERS) {
+    if (!user) continue;
+    if (lower.includes(`@${user}`)) {
+      targets.add(user);
+      continue;
+    }
+    const rx = new RegExp(`\\b${user}\\b`, "i");
+    if (rx.test(lower)) {
+      targets.add(user);
+    }
+  }
+  for (const [alias, mappedUser] of trackedAliasesMap.entries()) {
+    const cleanUser = normalizeUsername(mappedUser);
+    if (!cleanUser || !TRACKED_USERS.has(cleanUser)) continue;
+    const rx = new RegExp(`\\b${alias}\\b`, "i");
+    if (rx.test(lower)) {
+      targets.add(cleanUser);
+    }
+  }
+  return [...targets];
 }
 
 function compactMessageSummary(text) {
@@ -313,9 +366,11 @@ function buildTaskTitle(targetUsername, senderUsername, text) {
   return `[TG] @${targetUsername} — ${snippet} (${sender})`;
 }
 
-function chooseTargets({ mentions, senderUsername, botMentioned }) {
+function chooseTargets({ mentions, senderUsername, botMentioned, text }) {
   const explicit = [...mentions].filter((u) => TRACKED_USERS.has(u));
   if (explicit.length) return explicit;
+  const inferred = inferTargetsFromText(text).filter((u) => TRACKED_USERS.has(u));
+  if (inferred.length) return inferred;
   if (botMentioned && senderUsername && TRACKED_USERS.has(senderUsername)) {
     return [senderUsername];
   }
@@ -532,12 +587,17 @@ function startCompletionFollowupMonitor() {
 
 async function handleStatusCommand(msg) {
   const chatId = String(msg?.chat?.id || "");
+  const last = state.last_events[state.last_events.length - 1];
+  const lastStr = last
+    ? `${new Date(Number(last.ts || Date.now())).toISOString()} ${last.type}`
+    : "(none)";
   const text =
     `inch_task_bot status\n` +
     `asana: ${ASANA_ENABLED ? "enabled" : "disabled"}\n` +
     `tracked users: ${[...TRACKED_USERS].map((u) => `@${u}`).join(", ")}\n` +
     `working chats: ${getWorkingChatIds().join(", ") || "(none)"}\n` +
-    `debug chats (tech): ${getDebugChatIds().join(", ") || "(none)"}`;
+    `debug chats (tech): ${getDebugChatIds().join(", ") || "(none)"}\n` +
+    `last event: ${lastStr}`;
   await tgSend(chatId, text);
 }
 
@@ -545,11 +605,19 @@ async function handleManualChatCommands(msg, text) {
   const chatId = String(msg?.chat?.id || "");
   const cmd = String(text || "").trim().toLowerCase();
   const statusCmd = /(?:^|\s)\/status(?:@\w+)?(?:\s|$)/.test(cmd);
+  const lastCmd = /(?:^|\s)\/last_events(?:@\w+)?(?:\s|$)/.test(cmd);
   const workingCmd = /(?:^|\s)\/set_working_chat(?:@\w+)?(?:\s|$)/.test(cmd);
   const debugCmd = /(?:^|\s)\/set_debug_chat(?:@\w+)?(?:\s|$)/.test(cmd);
 
   if (statusCmd) {
     await handleStatusCommand(msg);
+    return true;
+  }
+  if (lastCmd) {
+    const rows = state.last_events.slice(-10).map((ev) => (
+      `${new Date(Number(ev.ts || Date.now())).toISOString()} ${ev.type} chat=${ev.chat_id || "-"} msg=${ev.message_id || "-"}`
+    ));
+    await tgSend(chatId, rows.length ? rows.join("\n") : "No recent events.");
     return true;
   }
   if (workingCmd) {
@@ -577,13 +645,26 @@ async function processMessage(msg) {
 
   const chat = msg.chat || {};
   const chatId = String(chat.id || "");
+  recordEvent("incoming_message", {
+    chat_id: chatId,
+    message_id: Number(msg.message_id || 0),
+    text_preview: clipText(text, 80),
+  });
   if (!isWorkingChat(chat)) return;
 
   const mentions = extractMentions(msg, text);
   const botMentioned = mentions.has(BOT_USERNAME);
   const senderUsername = normalizeUsername(msg.from?.username || "");
-  const targets = chooseTargets({ mentions, senderUsername, botMentioned });
-  if (!targets.length) return;
+  const targets = chooseTargets({ mentions, senderUsername, botMentioned, text });
+  if (!targets.length) {
+    recordEvent("skip_no_targets", {
+      chat_id: chatId,
+      message_id: Number(msg.message_id || 0),
+      sender: senderUsername || "",
+      mentions: [...mentions],
+    });
+    return;
+  }
 
   if (!ASANA_ENABLED) {
     await notifyDebug(`⚠️ skipped: Asana disabled. chat=${chatId} msg=${msg.message_id}`);
@@ -619,6 +700,12 @@ async function processMessage(msg) {
         (duplicate?.permalink_url ? `\n${duplicate.permalink_url}` : "");
       await notifyWorking(chatId, duplicateText);
       await notifyDebug(`duplicate skipped chat=${chatId} msg=${msg.message_id} target=@${target} existing_task=${duplicate.gid}`);
+      recordEvent("duplicate_task", {
+        chat_id: chatId,
+        message_id: Number(msg.message_id || 0),
+        target,
+        existing_task_gid: String(duplicate.gid),
+      });
       continue;
     }
 
@@ -661,6 +748,12 @@ async function processMessage(msg) {
       (created?.permalink_url ? `${created.permalink_url}` : "");
     await notifyWorking(chatId, friendly);
     await notifyDebug(`task created chat=${chatId} msg=${msg.message_id} target=@${target} task=${created?.gid || "(unknown)"}`);
+    recordEvent("task_created", {
+      chat_id: chatId,
+      message_id: Number(msg.message_id || 0),
+      target,
+      task_gid: String(created?.gid || ""),
+    });
   }
 
   await saveState();
@@ -674,6 +767,11 @@ async function processUpdate(update) {
   } catch (err) {
     const details = `❌ process error\nchat=${msg?.chat?.id || "?"}\nmsg=${msg?.message_id || "?"}\n${err?.message || String(err)}`;
     console.log(details);
+    recordEvent("process_error", {
+      chat_id: String(msg?.chat?.id || ""),
+      message_id: Number(msg?.message_id || 0),
+      error: String(err?.message || err || ""),
+    });
     await notifyDebug(details);
   }
 }
