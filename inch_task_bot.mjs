@@ -36,7 +36,7 @@ const ASANA_API_BASE = process.env.ASANA_API_BASE || "https://app.asana.com/api/
 const ASANA_WORKSPACE_GID = (process.env.ASANA_WORKSPACE_GID || "").trim();
 const ASANA_PROJECT_GID = (process.env.ASANA_PROJECT_GID || "").trim();
 const ASANA_PROJECT_NAME = (process.env.ASANA_PROJECT_NAME || "General Tasks").trim();
-const ASANA_TASK_FETCH_LIMIT = Math.max(20, Math.min(300, parseInt(process.env.ASANA_TASK_FETCH_LIMIT || "120", 10)));
+const ASANA_TASK_FETCH_LIMIT = Math.max(20, Math.min(100, parseInt(process.env.ASANA_TASK_FETCH_LIMIT || "100", 10)));
 
 const TRACKED_USERS = new Set(
   (process.env.TRACKED_USERS ||
