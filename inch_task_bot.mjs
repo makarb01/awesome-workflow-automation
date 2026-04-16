@@ -120,6 +120,45 @@ function normalizeUsername(value) {
   return String(value || "").trim().replace(/^@/, "").toLowerCase();
 }
 
+function isAnonymousAdminMessage(msg) {
+  const fromId = Number(msg?.from?.id || 0);
+  const chatId = String(msg?.chat?.id || "");
+  const senderChatId = String(msg?.sender_chat?.id || "");
+  return fromId === 1087968824 && chatId && senderChatId && chatId === senderChatId;
+}
+
+function senderIdentity(msg) {
+  const username = normalizeUsername(msg?.from?.username || "");
+  if (username) {
+    return {
+      username,
+      line: `@${username}`,
+      name: `@${username}`,
+    };
+  }
+  const fullName = `${msg?.from?.first_name || ""} ${msg?.from?.last_name || ""}`.trim();
+  if (fullName) {
+    return {
+      username: "",
+      line: fullName,
+      name: fullName,
+    };
+  }
+  const senderTitle = String(msg?.sender_chat?.title || "").trim();
+  if (senderTitle) {
+    return {
+      username: "",
+      line: senderTitle,
+      name: senderTitle,
+    };
+  }
+  return {
+    username: "",
+    line: "(unknown)",
+    name: "(unknown)",
+  };
+}
+
 function clipText(text, maxLen = 160) {
   const s = String(text || "").trim();
   if (s.length <= maxLen) return s;
