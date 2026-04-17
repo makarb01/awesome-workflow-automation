@@ -59,6 +59,18 @@ Map value can be:
 - Asana user email (resolved to gid), or
 - direct Asana user gid.
 
+## Internal workers filter (anti-noise)
+To avoid creating tasks from internal team chatter:
+- `BLOCK_INTERNAL_REQUESTERS=1`
+- `INTERNAL_REQUESTERS=...`
+
+With this enabled, internal requesters are skipped unless message has an explicit override marker, e.g.:
+- `#task`
+- `/task`
+- `task:`
+
+Also, if a short follow-up is sent as a reply, bot can merge context from the replied message.
+
 ## Deduplication
 - Primary key: `<chat_id>:<message_id>:<target_username>`
 - Also checks open project tasks for:

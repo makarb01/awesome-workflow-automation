@@ -48,6 +48,16 @@ const TRACKED_USERS = new Set(
 const TRACKED_ALIASES_RAW =
   process.env.TRACKED_ALIASES ||
   "makar=makarbizyukin,dasha=dshwwxzz,yaroslav=yaroslavandreev00,mitali=mitali_1515";
+const INTERNAL_REQUESTERS = new Set(
+  (process.env.INTERNAL_REQUESTERS ||
+    "@makarbizyukin,@dshwwxzz,@yaroslavandreev00,@Mitali_1515")
+    .split(",")
+    .map((x) => x.trim().replace(/^@/, "").toLowerCase())
+    .filter(Boolean),
+);
+const BLOCK_INTERNAL_REQUESTERS = (process.env.BLOCK_INTERNAL_REQUESTERS || "1") === "1";
+const INTERNAL_REQUESTER_OVERRIDE_PATTERN =
+  process.env.INTERNAL_REQUESTER_OVERRIDE_PATTERN || "(#task|/task|task:)";
 
 const TG_ASANA_MAP_RAW =
   process.env.TG_ASANA_MAP ||
@@ -96,11 +106,18 @@ const state = {
 
 const tgAsanaMap = parseKvMap(TG_ASANA_MAP_RAW);
 const trackedAliasesMap = parseKvMap(TRACKED_ALIASES_RAW);
+let internalRequesterOverrideRegex;
 let asanaWorkspaceCache = ASANA_WORKSPACE_GID;
 let asanaProjectCache = ASANA_PROJECT_GID;
 let asanaUsersCache = null;
 let nextUpdateOffset = 0;
 let completionCheckRunning = false;
+
+try {
+  internalRequesterOverrideRegex = new RegExp(INTERNAL_REQUESTER_OVERRIDE_PATTERN, "i");
+} catch {
+  internalRequesterOverrideRegex = /(#task|\/task|task:)/i;
+}
 
 function parseKvMap(raw) {
   const map = new Map();
@@ -442,15 +459,31 @@ function buildTaskTitle(targetUsername, senderUsername, text) {
   return `[TG] @${targetUsername} — ${snippet} (${sender})`;
 }
 
-function chooseTargets({ mentions, senderUsername, botMentioned, text }) {
-  const explicit = [...mentions].filter((u) => TRACKED_USERS.has(u));
-  if (explicit.length) return explicit;
+function chooseTargets({ currentMentions, replyMentions, senderUsername, botMentioned, text, allowReplyMentions }) {
+  const explicitCurrent = [...currentMentions].filter((u) => TRACKED_USERS.has(u));
+  if (explicitCurrent.length) return explicitCurrent;
+  if (allowReplyMentions) {
+    const explicitReply = [...replyMentions].filter((u) => TRACKED_USERS.has(u));
+    if (explicitReply.length) return explicitReply;
+  }
   const inferred = inferTargetsFromText(text).filter((u) => TRACKED_USERS.has(u));
   if (inferred.length) return inferred;
   if (botMentioned && senderUsername && TRACKED_USERS.has(senderUsername)) {
     return [senderUsername];
   }
   return [];
+}
+
+function isInternalRequester(username) {
+  const u = normalizeUsername(username);
+  return Boolean(u && INTERNAL_REQUESTERS.has(u));
+}
+
+function hasInternalRequesterOverride(text, botMentioned) {
+  const raw = String(text || "");
+  if (internalRequesterOverrideRegex.test(raw)) return true;
+  if (botMentioned && /(?:^|\s)\/task(?:@\w+)?(?:\s|$)/i.test(raw)) return true;
+  return false;
 }
 
 async function asanaRequest(method, endpoint, body = null) {
@@ -732,17 +765,31 @@ async function processMessage(msg) {
   }
   if (!isWorkingChat(chat)) return;
 
-  const mentions = new Set([
-    ...extractMentions(msg, text),
-    ...extractMentions(msg.reply_to_message || {}, replyText),
-  ]);
-  const botMentioned = mentions.has(BOT_USERNAME);
+  const currentMentions = extractMentions(msg, text);
+  const replyMentions = extractMentions(msg.reply_to_message || {}, replyText);
+  const mentions = new Set([...currentMentions, ...replyMentions]);
+  const botMentioned = currentMentions.has(BOT_USERNAME);
   const senderUsername = normalizeUsername(msg.from?.username || "");
+  if (
+    BLOCK_INTERNAL_REQUESTERS
+    && isInternalRequester(senderUsername)
+    && !hasInternalRequesterOverride(text, botMentioned)
+  ) {
+    recordEvent("skip_internal_requester", {
+      chat_id: chatId,
+      message_id: Number(msg.message_id || 0),
+      sender: senderUsername,
+    });
+    await saveState();
+    return;
+  }
   const targets = chooseTargets({
-    mentions,
+    currentMentions,
+    replyMentions,
     senderUsername,
     botMentioned,
     text: `${text}\n${replyText}`.trim() || effectiveText,
+    allowReplyMentions: effectiveText !== text,
   });
   if (!targets.length) {
     recordEvent("skip_no_targets", {
