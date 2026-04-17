@@ -58,6 +58,17 @@ const INTERNAL_REQUESTERS = new Set(
 const BLOCK_INTERNAL_REQUESTERS = (process.env.BLOCK_INTERNAL_REQUESTERS || "1") === "1";
 const INTERNAL_REQUESTER_OVERRIDE_PATTERN =
   process.env.INTERNAL_REQUESTER_OVERRIDE_PATTERN || "(#task|/task|task:)";
+const TASK_INTENT_OVERRIDE_PATTERN =
+  process.env.TASK_INTENT_OVERRIDE_PATTERN || "(#task|/task|task:|todo|to do)";
+const TASK_INTENT_ACTION_KEYWORDS = (process.env.TASK_INTENT_ACTION_KEYWORDS ||
+  "add,top up,recharge,create,set,fix,update,launch,prepare,send,check,review,approve,block,unblock,connect,assign,pay,refund,replace,upload,invite,make,give,enable,disable").split(",")
+  .map((x) => x.trim().toLowerCase())
+  .filter(Boolean);
+const TASK_INTENT_OBJECT_KEYWORDS = (process.env.TASK_INTENT_OBJECT_KEYWORDS ||
+  "account,accounts,balance,campaign,ad,ads,profile,profiles,bm,pixel,page,pages,task,sheet,link,budget,creative,access,admin,payment,invoice,domain,server,bot,report,lead,crm,integration").split(",")
+  .map((x) => x.trim().toLowerCase())
+  .filter(Boolean);
+const TASK_INTENT_MIN_SCORE = Math.max(2, parseInt(process.env.TASK_INTENT_MIN_SCORE || "3", 10));
 
 const TG_ASANA_MAP_RAW =
   process.env.TG_ASANA_MAP ||
@@ -117,6 +128,12 @@ try {
   internalRequesterOverrideRegex = new RegExp(INTERNAL_REQUESTER_OVERRIDE_PATTERN, "i");
 } catch {
   internalRequesterOverrideRegex = /(#task|\/task|task:)/i;
+}
+let taskIntentOverrideRegex;
+try {
+  taskIntentOverrideRegex = new RegExp(TASK_INTENT_OVERRIDE_PATTERN, "i");
+} catch {
+  taskIntentOverrideRegex = /(#task|\/task|task:|todo|to do)/i;
 }
 
 function parseKvMap(raw) {
@@ -486,6 +503,74 @@ function hasInternalRequesterOverride(text, botMentioned) {
   return false;
 }
 
+function hasAnyKeyword(text, keywords) {
+  const normalized = normalizeText(text);
+  if (!normalized) return false;
+  return keywords.some((kw) => kw && normalized.includes(kw));
+}
+
+function detectTaskIntent({ text, effectiveText, replyText, botMentioned }) {
+  const raw = String(text || "").trim();
+  const merged = String(effectiveText || text || "").trim();
+  const reply = String(replyText || "").trim();
+  if (!merged) return { isTask: false, score: 0, reason: "empty" };
+  if (taskIntentOverrideRegex.test(raw)) {
+    return { isTask: true, score: 99, reason: "explicit_override" };
+  }
+
+  let score = 0;
+  const reasons = [];
+
+  const hasAction = hasAnyKeyword(merged, TASK_INTENT_ACTION_KEYWORDS);
+  if (hasAction) {
+    score += 2;
+    reasons.push("action");
+  }
+  const hasObject = hasAnyKeyword(merged, TASK_INTENT_OBJECT_KEYWORDS);
+  if (hasObject) {
+    score += 1;
+    reasons.push("object");
+  }
+  const hasAmount = /([$€£]\s?\d+|\b\d+\s?(usd|eur|uah|aed|\$)\b)/i.test(`${raw}\n${merged}`);
+  if (hasAmount) {
+    score += 1;
+    reasons.push("amount");
+  }
+  const hasRequestCue = /\b(please|pls|need you|can you|could you|let'?s|kindly)\b/i.test(`${raw}\n${merged}`);
+  if (hasRequestCue) {
+    score += 1;
+    reasons.push("request_cue");
+  }
+  const hasUrgency = /\b(asap|today|urgent|deadline|by\s+\w+|before\s+\w+)\b/i.test(`${raw}\n${merged}`);
+  if (hasUrgency) {
+    score += 1;
+    reasons.push("urgency");
+  }
+  if (botMentioned) {
+    score += 1;
+    reasons.push("bot_mentioned");
+  }
+  if (reply && hasAnyKeyword(reply, TASK_INTENT_ACTION_KEYWORDS) && hasAnyKeyword(reply, TASK_INTENT_OBJECT_KEYWORDS)) {
+    score += 1;
+    reasons.push("reply_context_action");
+  }
+
+  const hasQuestionTone =
+    /\?$/.test(raw) || /\b(for what|is he|are you|do you|why|what|which|who)\b/i.test(normalizeText(raw));
+  if (hasQuestionTone && score < TASK_INTENT_MIN_SCORE + 1) {
+    score -= 1;
+    reasons.push("question_tone");
+  }
+
+  const words = normalizeText(merged).split(" ").filter(Boolean);
+  if (words.length <= 4 && score < TASK_INTENT_MIN_SCORE) {
+    return { isTask: false, score, reason: "too_short", reasons };
+  }
+
+  const isTask = score >= TASK_INTENT_MIN_SCORE;
+  return { isTask, score, reason: isTask ? "intent_positive" : "low_intent", reasons };
+}
+
 async function asanaRequest(method, endpoint, body = null) {
   const url = `${ASANA_API_BASE}${endpoint.startsWith("/") ? endpoint : `/${endpoint}`}`;
   const headers = {
@@ -797,6 +882,24 @@ async function processMessage(msg) {
       message_id: Number(msg.message_id || 0),
       sender: senderUsername || "",
       mentions: [...mentions],
+    });
+    await saveState();
+    return;
+  }
+  const taskIntent = detectTaskIntent({
+    text,
+    effectiveText,
+    replyText,
+    botMentioned,
+  });
+  if (!taskIntent.isTask) {
+    recordEvent("skip_non_task_intent", {
+      chat_id: chatId,
+      message_id: Number(msg.message_id || 0),
+      sender: senderUsername || "",
+      score: Number(taskIntent.score || 0),
+      reason: taskIntent.reason || "",
+      reasons: Array.isArray(taskIntent.reasons) ? taskIntent.reasons : [],
     });
     await saveState();
     return;

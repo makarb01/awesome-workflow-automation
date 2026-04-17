@@ -71,6 +71,20 @@ With this enabled, internal requesters are skipped unless message has an explici
 
 Also, if a short follow-up is sent as a reply, bot can merge context from the replied message.
 
+## Task intent awareness (context-aware)
+Bot now uses intent scoring so not every mention becomes a task.
+
+Controls:
+- `TASK_INTENT_OVERRIDE_PATTERN` - explicit force markers (`#task`, `/task`, `task:`)
+- `TASK_INTENT_MIN_SCORE` - minimum score to create task
+- optional keyword lists:
+  - `TASK_INTENT_ACTION_KEYWORDS`
+  - `TASK_INTENT_OBJECT_KEYWORDS`
+
+Result:
+- plain discussion/questions are skipped more often,
+- actionable requests with clear intent are captured.
+
 ## Deduplication
 - Primary key: `<chat_id>:<message_id>:<target_username>`
 - Also checks open project tasks for:
